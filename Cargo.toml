@@ -1,0 +1,19 @@
+[package]
+name = "libtock-embassy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libtock = {git = "https://www.github.com/tock/libtock-rs", rev = "0766d8cf65b21f01e3340e4b37b345b177a4fb55" }
+libtock_runtime = {git = "https://www.github.com/tock/libtock-rs", rev = "0766d8cf65b21f01e3340e4b37b345b177a4fb55" }
+libtock_debug_panic = {git = "https://www.github.com/tock/libtock-rs", rev = "0766d8cf65b21f01e3340e4b37b345b177a4fb55" }
+libtock_console = {git = "https://www.github.com/tock/libtock-rs", rev = "0766d8cf65b21f01e3340e4b37b345b177a4fb55" }
+libtock_leds = {git = "https://www.github.com/tock/libtock-rs", rev = "0766d8cf65b21f01e3340e4b37b345b177a4fb55" }
+libtock_platform = {git = "https://www.github.com/tock/libtock-rs", rev = "0766d8cf65b21f01e3340e4b37b345b177a4fb55" }
+embassy-executor = { version = "0.7", features = ["executor-thread"] }
+embassy-futures = "0.1"
+static_cell = "2"
+cortex-m = { version = "0.7.7", features = ["critical-section-single-core"] }
+
+[build-dependencies]
+libtock_build_scripts = {git = "https://www.github.com/tock/libtock-rs", rev = "0766d8cf65b21f01e3340e4b37b345b177a4fb55" }
