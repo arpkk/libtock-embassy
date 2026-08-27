@@ -13,8 +13,11 @@ ELF := $(TARGET_DIR)/$(TARGET)/release/examples/$(EXAMPLE)
 TAB_DIR := target/tab
 TAB := $(TAB_DIR)/$(EXAMPLE).tab
 PROTECTED_REGION_SIZE ?= 128
+# Flags de tockloader. La DK habla por JLink, no por bootloader serial.
+TOCKLOADER_FLAGS ?= --jlink --board nrf52dk
+LISTEN_PORT ?= /dev/cu.usbmodem0010502719211
 
-.PHONY: all build flash
+.PHONY: all build tab flash listen
 
 # Keep default behavior equivalent to prior `make all`.
 all: build
@@ -22,7 +25,15 @@ all: build
 build:
 	LIBTOCK_PLATFORM=$(PLATFORM) cargo build --example $(EXAMPLE) --release --target=$(TARGET) --target-dir=$(TARGET_DIR)
 
-flash: build
+tab: build
 	mkdir -p $(TAB_DIR)
 	elf2tab --kernel-major 2 --kernel-minor 1 -n $(EXAMPLE) -o $(TAB) --stack 1024 --minimum-footer-size 256 --protected-region-size $(PROTECTED_REGION_SIZE) $(ELF),$(APP_ARCH)
-	tockloader install $(TAB)
+
+# La app queda linkeada a una dirección fija, así que solo cabe una: hay que
+# desinstalar antes de instalar (el `|| true` es para cuando la placa ya está vacía).
+flash: tab
+	tockloader uninstall $(TOCKLOADER_FLAGS) || true
+	tockloader install $(TOCKLOADER_FLAGS) $(TAB)
+
+listen:
+	tockloader listen --port $(LISTEN_PORT)

@@ -1,3 +1,17 @@
+//! Driver de alarma bloqueante
+//!
+//! `sleep_for` es `async` solo de firma. Adentro hace `share::scope` +
+//! `subscribe` + `loop { yield_wait() }`, o sea nunca devuelve `Pending` ni cede
+//! al executor: mientras una tarea duerme acá, las demás no avanzan. Se conserva
+//! como referencia para los benchmarks contra [`crate::time_driver`].
+//!
+//! **No mezclar con el driver de tiempo.** Los dos se suscriben al par
+//! `(driver 0x0, subscribe 0)`. Si una tarea llama a `sleep_for` mientras corre
+//! [`crate::run`], le roba la upcall al driver de tiempo y al salir del
+//! `share::scope` hace `unsubscribe`, dejando a `embassy_time::Timer` mudo para
+//! siempre. Bajo `crate::run` esto se detecta y hace panic
+//! ([`crate::time_driver::DetectSteal`]). Para dormir usar `Timer::after`.
+
 use core::cell::Cell;
 
 use libtock_platform::share;
