@@ -16,6 +16,9 @@ PROTECTED_REGION_SIZE ?= 128
 # Flags de tockloader. La DK habla por JLink, no por bootloader serial.
 TOCKLOADER_FLAGS ?= --jlink --board nrf52dk
 LISTEN_PORT ?= /dev/cu.usbmodem0010502719211
+# Features de cargo. `make flash EXAMPLE=time_trace FEATURES=trace-time`
+FEATURES ?=
+CARGO_FEATURES := $(if $(FEATURES),--features $(FEATURES),)
 
 .PHONY: all build tab flash listen
 
@@ -23,7 +26,7 @@ LISTEN_PORT ?= /dev/cu.usbmodem0010502719211
 all: build
 
 build:
-	LIBTOCK_PLATFORM=$(PLATFORM) cargo build --example $(EXAMPLE) --release --target=$(TARGET) --target-dir=$(TARGET_DIR)
+	LIBTOCK_PLATFORM=$(PLATFORM) cargo build --example $(EXAMPLE) $(CARGO_FEATURES) --release --target=$(TARGET) --target-dir=$(TARGET_DIR)
 
 tab: build
 	mkdir -p $(TAB_DIR)

@@ -25,8 +25,17 @@ embassy-time-driver = "0.2"
 # cada tarea de embassy-executor (sin heap, sin capacidad fija).
 embassy-time-queue-utils = { version = "0.3", features = ["integrated-timers"] }
 critical-section = "1.1"
+embassy-sync = { version = "0.8", optional = true }
 static_cell = "2"
 cortex-m = { version = "0.7.7", features = ["critical-section-single-core"] }
+
+[features]
+default = []
+trace-time = ["dep:embassy-sync"]
+
+[[example]]
+name = "time_trace"
+required-features = ["trace-time"]
 
 [build-dependencies]
 libtock_build_scripts = {git = "https://www.github.com/tock/libtock-rs", rev = "0766d8cf65b21f01e3340e4b37b345b177a4fb55" }

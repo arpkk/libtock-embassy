@@ -121,12 +121,23 @@ impl TockDriver {
 
     /// Arma la alarma del kernel. Devuelve `false` si `at` ya pasó, en cuyo caso
     /// quien llama tiene que volver a drenar la cola.
+    ///
+    /// Con la feature `trace-time` deja además un registro en [`trace`]. La
+    /// grabación va acá afuera y no dentro de `arm` para que el camino caliente
+    /// quede idéntico cuando la feature está apagada.
     fn set_alarm(&self, cs: CriticalSection, at: u64) -> bool {
+        let armed = self.arm(cs, at);
+        #[cfg(feature = "trace-time")]
+        trace::record(cs, self.high.borrow(cs).get(), self.last.borrow(cs).get(), at, armed);
+        armed
+    }
+
+    fn arm(&self, cs: CriticalSection, at: u64) -> bool {
         let now = self.extend(cs);
         // El clamp también cubre `at == u64::MAX` (cola vacía): queda un
         // keepalive pelado, que es lo que mantiene viva la cuenta de vueltas.
         let at = at.min(now + MAX_DT);
-        if at <= now {
+        if at <= now { //el plazo ya paso
             return false;
         }
         // `extend` acaba de refrescar `last`, así que `reference <= now`.
@@ -142,8 +153,8 @@ impl TockDriver {
     fn on_alarm(&self) {
         critical_section::with(|cs| {
             let mut queue = self.queue.borrow(cs).borrow_mut();
-            let mut next = queue.next_expiration(self.extend(cs));
-            while !self.set_alarm(cs, next) {
+            let mut next = queue.next_expiration(self.extend(cs)); //despierta a los vencidos y devuelve el próximo
+            while !self.set_alarm(cs, next) { //impide que el proceso duerma para siempre
                 next = queue.next_expiration(self.extend(cs));
             }
         })
@@ -202,4 +213,143 @@ pub fn init(f: impl FnOnce() -> Never) -> ! {
             .expect("could not subscribe to the alarm upcall");
         f()
     }) {}
+}
+
+/// Traza de las llamadas a `set_alarm`, para instrumentar el driver sin
+/// perturbarlo.
+///
+/// El driver corre dentro de una sección crítica, así que no puede imprimir:
+/// `Console::write` hace `yield_wait`, y eso dejaría entrar una upcall que
+/// reentra `on_alarm` y revienta el `RefCell` de la cola. La salida es grabar en
+/// un búfer estático (cero syscalls) y que alguien lo drene desde afuera.
+///
+/// Ver `examples/time_trace.rs`.
+#[cfg(feature = "trace-time")]
+pub mod trace {
+    use super::{MAX_DT, Mutex, RefCell};
+    use critical_section::CriticalSection;
+    use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+    use embassy_sync::signal::Signal;
+
+    /// Cuántos registros aguanta el búfer antes de empezar a pisar los viejos.
+    pub const CAP: usize = 64;
+
+    /// Una llamada a `set_alarm`.
+    #[derive(Copy, Clone, Debug, Default)]
+    pub struct Record {
+        /// Cuenta de vueltas al momento de la llamada.
+        pub high: u32,
+        /// Último valor crudo del contador. Es el `reference` que fue al kernel.
+        pub last: u32,
+        /// `at` como llegó de la cola. `u64::MAX` = la cola quedó vacía.
+        pub at_in: u64,
+        /// `at` después del clamp a `now + MAX_DT`.
+        pub at_out: u64,
+        /// `false` = el plazo ya había vencido y no se armó nada.
+        pub armed: bool,
+    }
+
+    impl Record {
+        const EMPTY: Record = Record {
+            high: 0,
+            last: 0,
+            at_in: 0,
+            at_out: 0,
+            armed: false,
+        };
+
+        /// `now()` reconstruido de `high`/`last`, sin volver a llamar al kernel.
+        pub fn now(&self) -> u64 {
+            ((self.high as u64) << 32) | self.last as u64
+        }
+
+        /// `dt` que se le mandó a la cápsula, en ticks. `None` si no se armó.
+        pub fn dt(&self) -> Option<u32> {
+            let now = self.now();
+            (self.at_out > now).then(|| (self.at_out - now) as u32)
+        }
+
+        /// `true` si el clamp de `MAX_DT` recortó el plazo pedido.
+        pub fn clamped(&self) -> bool {
+            self.at_out < self.at_in
+        }
+    }
+
+    struct Buffer {
+        buf: [Record; CAP],
+        /// Dónde se escribe el próximo registro.
+        head: usize,
+        len: usize,
+        /// Registros pisados por no drenar a tiempo.
+        lost: u32,
+    }
+
+    static TRACE: Mutex<RefCell<Buffer>> = Mutex::new(RefCell::new(Buffer {
+        buf: [Record::EMPTY; CAP],
+        head: 0,
+        len: 0,
+        lost: 0,
+    }));
+
+    /// Avisa que llegó al menos un registro nuevo.
+    ///
+    /// `Signal` retiene el estado, así que no hay despertares perdidos, y
+    /// coalesce: varios registros entre dos drenajes son un solo despertar.
+    static NEW: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+    /// Espera a que haya registros para drenar.
+    ///
+    /// Reemplaza al `Timer` periódico que tenía antes el drenador. La diferencia
+    /// importa: un drenador con temporizador se auto-registra en la traza y
+    /// ensucia justo lo que se quiere medir.
+    pub async fn wait() {
+        NEW.wait().await
+    }
+
+    /// Graba un registro. Solo escribe memoria: no hace syscalls y no cede el
+    /// procesador, así que es seguro llamarlo desde la sección crítica.
+    pub(super) fn record(cs: CriticalSection, high: u32, last: u32, at_in: u64, armed: bool) {
+        {
+            let mut t = TRACE.borrow(cs).borrow_mut();
+            let now = ((high as u64) << 32) | last as u64;
+            let head = t.head;
+            t.buf[head] = Record {
+                high,
+                last,
+                at_in,
+                at_out: at_in.min(now + MAX_DT),
+                armed,
+            };
+            t.head = (head + 1) % CAP;
+            if t.len == CAP {
+                t.lost = t.lost.saturating_add(1);
+            } else {
+                t.len += 1;
+            }
+        }
+        // Fuera del `borrow_mut`: `signal` despierta al drenador, y aunque eso
+        // solo lo encola (no lo ejecuta), no conviene tener el `RefCell` tomado
+        // mientras se toca el run queue del executor.
+        NEW.signal(());
+    }
+
+    /// Saca los registros acumulados, del más viejo al más nuevo.
+    ///
+    /// Devuelve cuántos copió en `out` y cuántos se perdieron por desborde desde
+    /// el drenaje anterior. Si `out` es más chico que lo acumulado, lo que no
+    /// quepa queda para la próxima.
+    pub fn drain(out: &mut [Record]) -> (usize, u32) {
+        critical_section::with(|cs| {
+            let mut t = TRACE.borrow(cs).borrow_mut();
+            let n = out.len().min(t.len);
+            // El más viejo está `len` posiciones atrás de `head`.
+            let start = (t.head + CAP - t.len) % CAP;
+            for (i, slot) in out.iter_mut().enumerate().take(n) {
+                *slot = t.buf[(start + i) % CAP];
+            }
+            t.len -= n;
+            let lost = core::mem::take(&mut t.lost);
+            (n, lost)
+        })
+    }
 }
