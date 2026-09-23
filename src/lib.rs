@@ -37,7 +37,16 @@ pub use embassy_executor;
 pub use embassy_futures;
 pub use embassy_time;
 
+/// Tipo vacío: `Never` en posición de retorno obliga a que una función no vuelva.
+///
+/// Es `!` estable, que todavía no se puede escribir en un bound `FnOnce() -> !`.
+/// Lo usan las capas de `init` que abren un `share::scope` permanente: al exigir
+/// que el closure no retorne, el tipo garantiza que el scope nunca se cierre y
+/// que el `unsubscribe` de `Subscribe::drop` no corra jamás.
+pub enum Never {}
+
 pub mod alarm;
+pub mod buttons;
 pub mod console;
 pub mod executor;
 pub mod leds;
@@ -65,11 +74,6 @@ pub use executor::run;
 //     use libtock_ambient_light as ambient_light;
 //     pub type AmbientLight = ambient_light::AmbientLight<super::runtime::TockSyscalls>;
 //     pub use ambient_light::IntensityListener;
-// }
-// pub mod buttons {
-//     use libtock_buttons as buttons;
-//     pub type Buttons = buttons::Buttons<super::runtime::TockSyscalls>;
-//     pub use buttons::{ButtonListener, ButtonState};
 // }
 // pub mod buzzer {
 //     use libtock_buzzer as buzzer;

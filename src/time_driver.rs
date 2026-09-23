@@ -177,9 +177,7 @@ impl libtock_platform::subscribe::Config for DetectSteal {
     }
 }
 
-/// Tipo vacío: `Never` en posición de retorno obliga a que la función no vuelva.
-/// Es `!` estable, que todavía no se puede escribir en un bound `FnOnce() -> !`.
-pub enum Never {}
+pub use crate::Never;
 
 /// Registra la upcall de alarma y corre `f` con el driver de tiempo vivo.
 ///
