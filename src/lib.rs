@@ -49,6 +49,7 @@ pub mod alarm;
 pub mod buttons;
 pub mod console;
 pub mod executor;
+pub mod gpio;
 pub mod leds;
 pub mod task;
 pub mod time_driver;
@@ -79,14 +80,6 @@ pub use executor::run;
 //     use libtock_buzzer as buzzer;
 //     pub type Buzzer = buzzer::Buzzer<super::runtime::TockSyscalls>;
 //     pub use buzzer::Note;
-// }
-// pub mod gpio {
-//     use libtock_gpio as gpio;
-//     pub type Gpio = gpio::Gpio<super::runtime::TockSyscalls>;
-//     pub use gpio::{
-//         Error, GpioInterruptListener, GpioState, InputPin, OutputPin, PinInterruptEdge, Pull,
-//         PullDown, PullNone, PullUp,
-//     };
 // }
 // pub mod i2c_master {
 //     use libtock_i2c_master as i2c_master;

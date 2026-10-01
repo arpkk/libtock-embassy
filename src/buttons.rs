@@ -1,48 +1,19 @@
-//! Espera asincrónica de eventos de botón sobre la cápsula de botones de Tock
-//! (driver num `0x3`).
+//! Espera asincrónica de eventos de botón (cápsula `0x3`).
 //!
-//! Dos tareas pueden esperar botones distintos sin bloquearse entre sí: cada una
-//! suspende su propio future y el executor sigue corriendo el resto. Es el mismo
-//! patrón de [`crate::time_driver`] pero con N fuentes de evento en vez de una.
+//! Cada botón se obtiene una sola vez con [`Button::take`]. Cada espera habilita la
+//! interrupción del botón en su primer `poll` (`command 1`) y la deshabilita al
+//! terminar (`command 2`). La cápsula entrega siempre ambos eventos, presionado y
+//! soltado, y la espera descarta los que no corresponden. La suscripción a la
+//! upcall es única y permanente, y se abre con [`init`].
 //!
-//! # El contrato con la cápsula
+//! Limitaciones relevantes:
 //!
-//! - `command(3, 0)` devuelve la cantidad de botones de la placa.
-//! - `command(3, 1, i)` habilita la interrupción del botón `i`, y `command(3, 2, i)`
-//!   la deshabilita. El flanco **no se elige**: la cápsula fuerza `EitherEdge`, o
-//!   sea siempre llegan los dos eventos, presionado y soltado.
-//! - `command(3, 3, i)` lee el estado actual, sin interrupciones de por medio.
-//! - La upcall trae `(índice, estado, _)`, con estado `1` = presionado.
+//! - Hay un solo slot por botón, por lo que dos eventos sin una espera activa se
+//!   reducen al último.
+//! - La frontera temporal de una espera es laxa. Tras una espera cancelada, la
+//!   siguiente puede recibir un evento anterior a su inicio.
 //!
-//! El filtrado por botón lo hace el kernel, no nosotros: `command 1` prende un bit
-//! en el `subscribe_map` del grant de la app y `fired()` solo agenda la upcall para
-//! las apps que tienen ese bit. Por eso `init` no habilita nada — habilitar es
-//! responsabilidad de quien empieza a esperar.
-//!
-//! Ojo con la granularidad de ese bitmask: es **por app**, no por waiter. Un
-//! `command 2` apaga el botón para todo el proceso. De ahí que [`Button`] se
-//! entregue una sola vez por índice ([`Button::take`]) y que las esperas tomen
-//! `&mut self`: dos waiters sobre el mismo botón serían un bug silencioso, donde
-//! el `Drop` de uno deja mudo al otro. Acá el tipo lo vuelve imposible.
-//!
-//! # Se pierden eventos, a propósito
-//!
-//! Hay **un solo slot de evento por botón**. Si se aprieta y se suelta rápido
-//! mientras nadie está en el `await`, el segundo evento pisa al primero y solo
-//! sobrevive uno. Es inherente a un slot único y es la decisión tomada: la
-//! alternativa sería una cola por botón, que en el caso normal (una tarea esperando
-//! su botón) no compra nada y cuesta RAM estática en todos los casos. Si alguna vez
-//! hace falta no perder ninguna transición, el lugar para cambiarlo es [`Slot`].
-//!
-//! # Por qué el orden del primer poll importa
-//!
-//! El primer `poll` hace, en este orden: limpiar `last`, registrar el waker,
-//! habilitar la interrupción, y recién ahí mirar `last`. Limpiar **antes** de
-//! habilitar es lo que define la frontera temporal de la espera: el kernel puede
-//! haber encolado una upcall de una espera anterior que se canceló, y esa upcall se
-//! entrega igual en el siguiente `yield`. Sin la limpieza, un `wait_for_change`
-//! nuevo devolvería `Ready` de inmediato por un evento viejo. Con ella, todo lo que
-//! aparezca en `last` después de habilitar es legítimo.
+//! El análisis completo está en `docs/documentacion.md`, secciones 2.2 y 3.
 
 use core::cell::Cell;
 use core::future::Future;
@@ -59,7 +30,7 @@ use crate::runtime::TockSyscalls as S;
 
 /// Driver number de la cápsula de botones.
 pub const DRIVER_NUM: u32 = 0x3;
-/// Subscribe number de la upcall de botones. Es una sola para todos los botones.
+/// Subscribe number de la upcall de botones, común a todos los botones.
 pub const SUBSCRIBE_BUTTON: u32 = 0;
 
 mod command {
@@ -69,12 +40,10 @@ mod command {
     pub const READ: u32 = 3;
 }
 
-/// Cota de compilación para la tabla de slots. La cantidad real de botones se
-/// sabe en runtime; [`init`] valida que la placa no reporte más que esto.
+/// Capacidad de la tabla de slots. [`init`] verifica que la placa no la supere.
 const MAX_BUTTONS: usize = 8;
 
-/// Estado de un botón, ya normalizado por la cápsula (contempla la polaridad del
-/// pin, así que "presionado" es lógico y no el nivel eléctrico).
+/// Estado lógico de un botón, normalizado por la cápsula según la polaridad del pin.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ButtonState {
     Released,
@@ -90,17 +59,10 @@ impl From<u32> for ButtonState {
     }
 }
 
-/// Punto de encuentro entre la upcall y el future de un botón.
+/// Punto de encuentro entre la upcall y la espera de un botón.
 ///
-/// `Cell` y no `RefCell`: la upcall corre dentro de un `yield`, y ese `yield`
-/// puede estar ocurriendo dentro del `poll()` de una tarea (por ejemplo, un
-/// `Console::write`, que bloquea por dentro). Con `RefCell` el handler podría
-/// encontrarse el préstamo tomado por ese `poll` y hacer panic en runtime. `Cell`
-/// no tiene estado de préstamo, así que ese modo de falla no existe.
-///
-/// El `Mutex` de `critical-section` no es un lock con estado: es solo el token que
-/// exige presentar una sección crítica para acceder, y es lo que vuelve el `Cell`
-/// utilizable desde un `static`.
+/// Se usa `Cell` y no `RefCell` porque la upcall puede ejecutarse durante un
+/// `yield` dentro del `poll` de otra tarea.
 struct Slot {
     waker: Mutex<Cell<Option<Waker>>>,
     last: Mutex<Cell<Option<ButtonState>>>,
@@ -158,17 +120,15 @@ static SLOTS: [Slot; MAX_BUTTONS] = [const { Slot::new() }; MAX_BUTTONS];
 /// Bitmask de los índices ya entregados por [`Button::take`].
 static TAKEN: AtomicU32 = AtomicU32::new(0);
 
-/// Receptor de la upcall. Es uno solo para todos los botones: la cápsula tiene un
-/// único subscribe slot y despacha por índice.
+/// Receptor único de la upcall de botones.
 struct Listener;
 
 static LISTENER: Listener = Listener;
 
 impl Upcall<OneId<DRIVER_NUM, SUBSCRIBE_BUTTON>> for Listener {
     fn upcall(&self, index: u32, state: u32, _: u32) {
-        // Un índice fuera de rango solo puede venir de una placa que reporta más
-        // botones de los que `init` aceptó, cosa que `init` ya descarta. Se ignora
-        // en vez de indexar y hacer panic desde dentro de una upcall.
+        // Un índice fuera de la tabla se ignora en lugar de provocar un panic
+        // dentro de una upcall.
         if let Some(slot) = SLOTS.get(index as usize) {
             slot.put(ButtonState::from(state));
             slot.wake();
@@ -176,14 +136,8 @@ impl Upcall<OneId<DRIVER_NUM, SUBSCRIBE_BUTTON>> for Listener {
     }
 }
 
-/// `subscribe::Config` que hace ruido si alguien más ya tenía registrada la upcall
-/// de botones.
-///
-/// Mismo razonamiento que [`crate::time_driver::DetectSteal`]: el subscribe slot
-/// `(0x3, 0)` es único, así que `libtock_buttons::Buttons::register_listener` o
-/// cualquier otro usuario lo pisaría y, al cerrar su `share::scope`, haría
-/// `unsubscribe`. El resultado serían esperas que nunca despiertan. Mejor un panic
-/// ruidoso que un cuelgue silencioso.
+/// Provoca un panic si otro componente ya había registrado la upcall de botones,
+/// en lugar de dejar esperas que nunca despiertan.
 pub struct DetectSteal;
 
 impl libtock_platform::subscribe::Config for DetectSteal {
@@ -192,15 +146,11 @@ impl libtock_platform::subscribe::Config for DetectSteal {
     }
 }
 
-/// Registra la upcall de botones y corre `f` con el listener vivo.
+/// Registra la upcall de botones de forma permanente y ejecuta `f`.
 ///
-/// Igual que [`crate::time_driver::init`], la suscripción se abre en un
-/// `share::scope` que por tipo no puede terminar: `f` devuelve [`Never`], así que
-/// `Subscribe::drop` no corre jamás y el kernel puede escribir en la upcall durante
-/// toda la vida del proceso.
-///
-/// Compone anidado con el de tiempo. Como [`crate::run`] ya abre el de alarma por
-/// dentro, este va por fuera:
+/// Como `f` devuelve [`Never`], el `share::scope` no termina y la suscripción
+/// permanece válida durante toda la vida del proceso. [`crate::run`] va al fondo
+/// del anidamiento:
 ///
 /// ```ignore
 /// fn main() {
@@ -225,11 +175,8 @@ pub fn init(f: impl FnOnce() -> Never) -> ! {
 
 /// Acceso exclusivo a un botón.
 ///
-/// Se obtiene una sola vez por índice con [`Button::take`]. Las esperas toman
-/// `&mut self`, así que no puede haber dos waiters sobre el mismo botón (ver la
-/// nota sobre el `subscribe_map` en el doc del módulo).
-///
-/// Lleva solo un `u32`, así que es `'static` y entra en un `#[embassy_executor::task]`.
+/// Las esperas toman `&mut self`, lo que garantiza una sola espera por botón. Es
+/// necesario porque deshabilitar un botón lo desactiva para todo el proceso.
 pub struct Button {
     index: u32,
 }
@@ -240,16 +187,12 @@ impl Button {
         S::command(DRIVER_NUM, command::COUNT, 0, 0).to_result()
     }
 
-    /// Toma el botón `index`, o `None` si no existe o si ya fue tomado.
-    ///
-    /// Devolverlo (drop) libera el índice para un `take` posterior.
+    /// Toma el botón `index`. Devuelve `None` si no existe o si ya fue tomado.
     pub fn take(index: u32) -> Option<Button> {
         if index as usize >= MAX_BUTTONS || index >= Self::count().ok()? {
             return None;
         }
         let bit = 1u32 << index;
-        // `fetch_or` devuelve el valor previo: si el bit ya estaba puesto, el botón
-        // tiene dueño.
         if TAKEN.fetch_or(bit, Ordering::AcqRel) & bit != 0 {
             None
         } else {
@@ -261,13 +204,13 @@ impl Button {
         self.index
     }
 
-    /// Lee el estado actual, sin esperar. No necesita la interrupción habilitada.
+    /// Lee el estado actual, sin esperar.
     pub fn read(&self) -> Result<ButtonState, ErrorCode> {
         let state: u32 = S::command(DRIVER_NUM, command::READ, self.index, 0).to_result()?;
         Ok(state.into())
     }
 
-    /// Espera la próxima transición, sea cual sea, y devuelve el estado nuevo.
+    /// Espera la próxima transición y devuelve el estado nuevo.
     pub async fn wait_for_change(&mut self) -> ButtonState {
         ButtonWait::new(self.index, None).await
     }
@@ -289,18 +232,14 @@ impl Drop for Button {
     }
 }
 
-/// Future de una espera sobre un botón.
+/// Espera sobre un botón.
 ///
-/// `want` filtra: `None` acepta cualquier transición, `Some(s)` descarta las que no
-/// son `s` y vuelve a `Pending`. El filtro vive **acá dentro** y no en un loop de
-/// futures en [`Button::wait_for_press`] a propósito: un loop crearía un future
-/// nuevo por cada evento descartado, y entre el `Drop` de uno y el `enable` del
-/// siguiente el botón queda deshabilitado. Esa ventana perdería justamente el
-/// evento que se está esperando.
+/// `want` filtra el tipo de evento dentro del future. Filtrar con un ciclo de
+/// futures deshabilitaría el botón entre un evento descartado y el siguiente.
 struct ButtonWait {
     index: u32,
     want: Option<ButtonState>,
-    /// Si ya corrió el primer `poll`, o sea si la interrupción está habilitada.
+    /// Indica si la interrupción ya fue habilitada por esta espera.
     armed: bool,
 }
 
@@ -322,20 +261,14 @@ impl Future for ButtonWait {
         let slot = &SLOTS[this.index as usize];
 
         if !this.armed {
-            // El orden es la parte delicada; está explicado en el doc del módulo.
+            // Orden: limpiar, registrar, habilitar, consultar. Ver
+            // `docs/documentacion.md`, secciones 2.2 y 3.
             slot.clear_last();
             slot.register(cx.waker());
-            // Habilitar acá y deshabilitar en `Drop` significa 2 syscalls por
-            // espera. La alternativa es habilitar en `Button::take` y deshabilitar
-            // en `Drop for Button`: cero syscalls por espera, a cambio de upcalls
-            // que solo escriben `last` y se descartan mientras nadie espera. Para
-            // medir esa variante, mover estas dos líneas y la de `Drop` — el resto
-            // del módulo no cambia.
             let _ = S::command(DRIVER_NUM, command::ENABLE_INTERRUPTS, this.index, 0)
                 .to_result::<(), ErrorCode>();
             this.armed = true;
         } else {
-            // El waker puede cambiar entre polls si la tarea migró de contexto.
             slot.register(cx.waker());
         }
 
@@ -357,18 +290,7 @@ impl Drop for ButtonWait {
             let _ = S::command(DRIVER_NUM, command::DISABLE_INTERRUPTS, self.index, 0)
                 .to_result::<(), ErrorCode>();
         }
-        // Deliberadamente NO se hace `unsubscribe` acá.
-        //
-        // El listener de `(0x3, 0)` es único y compartido por todos los botones: lo
-        // registra `init` una vez para todo el proceso. Un `unsubscribe` desde el
-        // Drop de *un* future dejaría sin eventos a todos los demás botones.
-        //
-        // Esto marca el límite de lo que el patrón actual de `libtock-rs` puede
-        // expresar. `share::scope` ata la vida de la suscripción a un bloque léxico,
-        // que es justo lo que una tarea async cancelable no tiene. Acá se esquiva
-        // haciendo la suscripción permanente, pero la solución general —un future
-        // cuyo `Drop` haga `unsubscribe` antes de liberar la memoria que el kernel
-        // podría escribir— sigue pendiente, y es la contribución central de la
-        // tesis. Ver sección 6 de la skill `tock-embassy-async`.
+        // No se hace `unsubscribe`: la suscripción es compartida por todos los
+        // botones. Ver `docs/documentacion.md`, sección 1.4.
     }
 }
