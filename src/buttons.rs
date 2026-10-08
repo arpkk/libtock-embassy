@@ -120,6 +120,12 @@ static SLOTS: [Slot; MAX_BUTTONS] = [const { Slot::new() }; MAX_BUTTONS];
 /// Bitmask de los índices ya entregados por [`Button::take`].
 static TAKEN: AtomicU32 = AtomicU32::new(0);
 
+/// Estado actual de un botón (`command 3`).
+fn read_state(index: u32) -> Result<ButtonState, ErrorCode> {
+    let state: u32 = S::command(DRIVER_NUM, command::READ, index, 0).to_result()?;
+    Ok(state.into())
+}
+
 /// Receptor único de la upcall de botones.
 struct Listener;
 
@@ -206,21 +212,23 @@ impl Button {
 
     /// Lee el estado actual, sin esperar.
     pub fn read(&self) -> Result<ButtonState, ErrorCode> {
-        let state: u32 = S::command(DRIVER_NUM, command::READ, self.index, 0).to_result()?;
-        Ok(state.into())
+        read_state(self.index)
     }
 
-    /// Espera la próxima transición y devuelve el estado nuevo.
+    /// Espera la próxima transición y devuelve el estado nuevo. Semántica de
+    /// flanco: aunque el botón no se mueva, nunca termina sin un evento nuevo.
     pub async fn wait_for_change(&mut self) -> ButtonState {
         ButtonWait::new(self.index, None).await
     }
 
-    /// Espera hasta que el botón se presione.
+    /// Espera hasta que el botón esté presionado. Semántica de nivel: si ya lo
+    /// está, termina de inmediato.
     pub async fn wait_for_press(&mut self) {
         ButtonWait::new(self.index, Some(ButtonState::Pressed)).await;
     }
 
-    /// Espera hasta que el botón se suelte.
+    /// Espera hasta que el botón esté suelto. Semántica de nivel: si ya lo está,
+    /// termina de inmediato.
     pub async fn wait_for_release(&mut self) {
         ButtonWait::new(self.index, Some(ButtonState::Released)).await;
     }
@@ -233,6 +241,10 @@ impl Drop for Button {
 }
 
 /// Espera sobre un botón.
+///
+/// Con `want` es una espera de nivel: el primer `poll` lee el estado y termina
+/// si ya es el buscado. Sin `want`, de flanco. Ver `docs/documentacion.md`,
+/// sección 2.2.
 ///
 /// `want` filtra el tipo de evento dentro del future. Filtrar con un ciclo de
 /// futures deshabilitaría el botón entre un evento descartado y el siguiente.
@@ -268,6 +280,14 @@ impl Future for ButtonWait {
             let _ = S::command(DRIVER_NUM, command::ENABLE_INTERRUPTS, this.index, 0)
                 .to_result::<(), ErrorCode>();
             this.armed = true;
+
+            // Nivel: se lee después de habilitar, así una transición posterior a la
+            // lectura igual genera upcall. Si la lectura falla, se espera el evento.
+            if let (Some(want), Ok(state)) = (this.want, read_state(this.index))
+                && state == want
+            {
+                return Poll::Ready(state);
+            }
         } else {
             slot.register(cx.waker());
         }
