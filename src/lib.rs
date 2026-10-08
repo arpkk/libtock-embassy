@@ -51,6 +51,7 @@ pub mod console;
 pub mod executor;
 pub mod gpio;
 pub mod leds;
+mod source;
 pub mod task;
 pub mod time_driver;
 

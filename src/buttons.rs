@@ -13,20 +13,17 @@
 //! - La frontera temporal de una espera es laxa. Tras una espera cancelada, la
 //!   siguiente puede recibir un evento anterior a su inicio.
 //!
-//! El análisis completo está en `docs/documentacion.md`, secciones 2.2 y 3.
+//! La estructura común con GPIO está en el módulo `source`.
 
-use core::cell::Cell;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicU32, Ordering};
-use core::task::{Context, Poll, Waker};
+use core::task::{Context, Poll};
 
-use critical_section::Mutex;
-use libtock_platform::subscribe::OneId;
-use libtock_platform::{ErrorCode, Syscalls, Upcall, share};
+use libtock_platform::{ErrorCode, Syscalls};
 
 use crate::Never;
 use crate::runtime::TockSyscalls as S;
+use crate::source::SourceTable;
 
 /// Driver number de la cápsula de botones.
 pub const DRIVER_NUM: u32 = 0x3;
@@ -40,7 +37,7 @@ mod command {
     pub const READ: u32 = 3;
 }
 
-/// Capacidad de la tabla de slots. [`init`] verifica que la placa no la supere.
+/// Capacidad de la tabla. [`init`] verifica que la placa no la supere.
 const MAX_BUTTONS: usize = 8;
 
 /// Estado lógico de un botón, normalizado por la cápsula según la polaridad del pin.
@@ -59,66 +56,8 @@ impl From<u32> for ButtonState {
     }
 }
 
-/// Punto de encuentro entre la upcall y la espera de un botón.
-///
-/// Se usa `Cell` y no `RefCell` porque la upcall puede ejecutarse durante un
-/// `yield` dentro del `poll` de otra tarea.
-struct Slot {
-    waker: Mutex<Cell<Option<Waker>>>,
-    last: Mutex<Cell<Option<ButtonState>>>,
-}
-
-impl Slot {
-    const fn new() -> Self {
-        Self {
-            waker: Mutex::new(Cell::new(None)),
-            last: Mutex::new(Cell::new(None)),
-        }
-    }
-
-    /// Registra el waker, sin clonar si ya es el mismo.
-    fn register(&self, w: &Waker) {
-        critical_section::with(|cs| {
-            let cell = self.waker.borrow(cs);
-            cell.set(match cell.replace(None) {
-                Some(old) if old.will_wake(w) => Some(old),
-                _ => Some(w.clone()),
-            });
-        })
-    }
-
-    fn clear_waker(&self) {
-        critical_section::with(|cs| self.waker.borrow(cs).set(None))
-    }
-
-    fn wake(&self) {
-        critical_section::with(|cs| {
-            let cell = self.waker.borrow(cs);
-            if let Some(w) = cell.replace(None) {
-                w.wake_by_ref();
-                cell.set(Some(w));
-            }
-        })
-    }
-
-    fn put(&self, state: ButtonState) {
-        critical_section::with(|cs| self.last.borrow(cs).set(Some(state)))
-    }
-
-    /// Consume el evento pendiente, si lo hay.
-    fn take(&self) -> Option<ButtonState> {
-        critical_section::with(|cs| self.last.borrow(cs).replace(None))
-    }
-
-    fn clear_last(&self) {
-        critical_section::with(|cs| self.last.borrow(cs).set(None))
-    }
-}
-
-static SLOTS: [Slot; MAX_BUTTONS] = [const { Slot::new() }; MAX_BUTTONS];
-
-/// Bitmask de los índices ya entregados por [`Button::take`].
-static TAKEN: AtomicU32 = AtomicU32::new(0);
+static BUTTONS: SourceTable<ButtonState, MAX_BUTTONS, DRIVER_NUM, SUBSCRIBE_BUTTON> =
+    SourceTable::new();
 
 /// Estado actual de un botón (`command 3`).
 fn read_state(index: u32) -> Result<ButtonState, ErrorCode> {
@@ -126,37 +65,9 @@ fn read_state(index: u32) -> Result<ButtonState, ErrorCode> {
     Ok(state.into())
 }
 
-/// Receptor único de la upcall de botones.
-struct Listener;
-
-static LISTENER: Listener = Listener;
-
-impl Upcall<OneId<DRIVER_NUM, SUBSCRIBE_BUTTON>> for Listener {
-    fn upcall(&self, index: u32, state: u32, _: u32) {
-        // Un índice fuera de la tabla se ignora en lugar de provocar un panic
-        // dentro de una upcall.
-        if let Some(slot) = SLOTS.get(index as usize) {
-            slot.put(ButtonState::from(state));
-            slot.wake();
-        }
-    }
-}
-
-/// Provoca un panic si otro componente ya había registrado la upcall de botones,
-/// en lugar de dejar esperas que nunca despiertan.
-pub struct DetectSteal;
-
-impl libtock_platform::subscribe::Config for DetectSteal {
-    fn returned_nonnull_upcall(_driver_num: u32, _subscribe_num: u32) {
-        panic!("button upcall already owned")
-    }
-}
-
 /// Registra la upcall de botones de forma permanente y ejecuta `f`.
 ///
-/// Como `f` devuelve [`Never`], el `share::scope` no termina y la suscripción
-/// permanece válida durante toda la vida del proceso. [`crate::run`] va al fondo
-/// del anidamiento:
+/// [`crate::run`] va al fondo del anidamiento:
 ///
 /// ```ignore
 /// fn main() {
@@ -164,19 +75,8 @@ impl libtock_platform::subscribe::Config for DetectSteal {
 /// }
 /// ```
 pub fn init(f: impl FnOnce() -> Never) -> ! {
-    let count: u32 = S::command(DRIVER_NUM, command::COUNT, 0, 0)
-        .to_result::<u32, ErrorCode>()
-        .expect("button driver not present");
-    assert!(
-        count as usize <= MAX_BUTTONS,
-        "la placa reporta más botones que MAX_BUTTONS"
-    );
-
-    match share::scope(|subscribe| {
-        S::subscribe::<_, _, DetectSteal, DRIVER_NUM, SUBSCRIBE_BUTTON>(subscribe, &LISTENER)
-            .expect("could not subscribe to the button upcall");
-        f()
-    }) {}
+    let count = Button::count().expect("button driver not present");
+    BUTTONS.init(count, f)
 }
 
 /// Acceso exclusivo a un botón.
@@ -195,14 +95,12 @@ impl Button {
 
     /// Toma el botón `index`. Devuelve `None` si no existe o si ya fue tomado.
     pub fn take(index: u32) -> Option<Button> {
-        if index as usize >= MAX_BUTTONS || index >= Self::count().ok()? {
-            return None;
-        }
-        let bit = 1u32 << index;
-        if TAKEN.fetch_or(bit, Ordering::AcqRel) & bit != 0 {
-            None
-        } else {
+        // El `Button` se construye solo si la reserva tuvo éxito: su `Drop` libera
+        // el bit, y uno construido de más liberaría el de otro dueño.
+        if index < Self::count().ok()? && BUTTONS.claim(index) {
             Some(Button { index })
+        } else {
+            None
         }
     }
 
@@ -236,15 +134,14 @@ impl Button {
 
 impl Drop for Button {
     fn drop(&mut self) {
-        TAKEN.fetch_and(!(1u32 << self.index), Ordering::AcqRel);
+        BUTTONS.release(self.index);
     }
 }
 
 /// Espera sobre un botón.
 ///
 /// Con `want` es una espera de nivel: el primer `poll` lee el estado y termina
-/// si ya es el buscado. Sin `want`, de flanco. Ver `docs/documentacion.md`,
-/// sección 2.2.
+/// si ya es el buscado. Sin `want`, de flanco.
 ///
 /// `want` filtra el tipo de evento dentro del future. Filtrar con un ciclo de
 /// futures deshabilitaría el botón entre un evento descartado y el siguiente.
@@ -270,26 +167,21 @@ impl Future for ButtonWait {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<ButtonState> {
         let this = self.get_mut();
-        let slot = &SLOTS[this.index as usize];
+        let index = this.index;
+        let slot = BUTTONS.slot(index);
 
-        if !this.armed {
-            // Orden: limpiar, registrar, habilitar, consultar. Ver
-            // `docs/documentacion.md`, secciones 2.2 y 3.
-            slot.clear_last();
-            slot.register(cx.waker());
-            let _ = S::command(DRIVER_NUM, command::ENABLE_INTERRUPTS, this.index, 0)
+        let first = slot.arm(&mut this.armed, cx.waker(), || {
+            let _ = S::command(DRIVER_NUM, command::ENABLE_INTERRUPTS, index, 0)
                 .to_result::<(), ErrorCode>();
-            this.armed = true;
+        });
 
-            // Nivel: se lee después de habilitar, así una transición posterior a la
-            // lectura igual genera upcall. Si la lectura falla, se espera el evento.
-            if let (Some(want), Ok(state)) = (this.want, read_state(this.index))
-                && state == want
-            {
-                return Poll::Ready(state);
-            }
-        } else {
-            slot.register(cx.waker());
+        // Nivel: se lee después de habilitar, así una transición posterior a la
+        // lectura igual genera upcall. Si la lectura falla, se espera el evento.
+        if first
+            && let (Some(want), Ok(state)) = (this.want, read_state(index))
+            && state == want
+        {
+            return Poll::Ready(state);
         }
 
         match slot.take() {
@@ -304,13 +196,12 @@ impl Future for ButtonWait {
 
 impl Drop for ButtonWait {
     fn drop(&mut self) {
-        let slot = &SLOTS[self.index as usize];
-        slot.clear_waker();
+        BUTTONS.slot(self.index).clear_waker();
         if self.armed {
             let _ = S::command(DRIVER_NUM, command::DISABLE_INTERRUPTS, self.index, 0)
                 .to_result::<(), ErrorCode>();
         }
         // No se hace `unsubscribe`: la suscripción es compartida por todos los
-        // botones. Ver `docs/documentacion.md`, sección 1.4.
+        // botones.
     }
 }

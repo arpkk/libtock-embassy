@@ -16,20 +16,17 @@
 //!   reducen al último.
 //! - La frontera temporal de una espera es laxa.
 //!
-//! El análisis completo está en `docs/documentacion.md`, secciones 2.3 y 3.
+//! La estructura común con botones está en el módulo `source`.
 
-use core::cell::Cell;
 use core::future::Future;
 use core::pin::Pin as Pinned;
-use core::sync::atomic::{AtomicU32, Ordering};
-use core::task::{Context, Poll, Waker};
+use core::task::{Context, Poll};
 
-use critical_section::Mutex;
-use libtock_platform::subscribe::OneId;
-use libtock_platform::{ErrorCode, Syscalls, Upcall, share};
+use libtock_platform::{ErrorCode, Syscalls};
 
 use crate::Never;
 use crate::runtime::TockSyscalls as S;
+use crate::source::SourceTable;
 
 /// Driver number de la cápsula de GPIO.
 pub const DRIVER_NUM: u32 = 0x4;
@@ -51,8 +48,8 @@ mod edge {
     pub const FALLING: u32 = 2;
 }
 
-/// Capacidad de la tabla de slots. [`init`] verifica que la placa no la supere.
-/// El límite superior es 32, el ancho de [`TAKEN`].
+/// Capacidad de la tabla. [`init`] verifica que la placa no la supere, y
+/// [`SourceTable`] no admite más de 32.
 const MAX_PINS: usize = 16;
 
 /// Resistencia interna de entrada. Usa los mismos nombres que `embassy-nrf`.
@@ -90,98 +87,11 @@ impl From<u32> for Level {
     }
 }
 
-/// Punto de encuentro entre la upcall y la espera de un pin.
-///
-/// Se usa `Cell` y no `RefCell` porque la upcall puede ejecutarse durante un
-/// `yield` dentro del `poll` de otra tarea.
-struct Slot {
-    waker: Mutex<Cell<Option<Waker>>>,
-    last: Mutex<Cell<Option<Level>>>,
-}
-
-impl Slot {
-    const fn new() -> Self {
-        Self {
-            waker: Mutex::new(Cell::new(None)),
-            last: Mutex::new(Cell::new(None)),
-        }
-    }
-
-    /// Registra el waker, sin clonar si ya es el mismo.
-    fn register(&self, w: &Waker) {
-        critical_section::with(|cs| {
-            let cell = self.waker.borrow(cs);
-            cell.set(match cell.replace(None) {
-                Some(old) if old.will_wake(w) => Some(old),
-                _ => Some(w.clone()),
-            });
-        })
-    }
-
-    fn clear_waker(&self) {
-        critical_section::with(|cs| self.waker.borrow(cs).set(None))
-    }
-
-    fn wake(&self) {
-        critical_section::with(|cs| {
-            let cell = self.waker.borrow(cs);
-            if let Some(w) = cell.replace(None) {
-                w.wake_by_ref();
-                cell.set(Some(w));
-            }
-        })
-    }
-
-    fn put(&self, level: Level) {
-        critical_section::with(|cs| self.last.borrow(cs).set(Some(level)))
-    }
-
-    /// Consume el evento pendiente, si lo hay.
-    fn take(&self) -> Option<Level> {
-        critical_section::with(|cs| self.last.borrow(cs).replace(None))
-    }
-
-    fn clear_last(&self) {
-        critical_section::with(|cs| self.last.borrow(cs).set(None))
-    }
-}
-
-static SLOTS: [Slot; MAX_PINS] = [const { Slot::new() }; MAX_PINS];
-
-/// Bitmask de los índices ya entregados por [`Pin::take`].
-static TAKEN: AtomicU32 = AtomicU32::new(0);
-
-/// Receptor único de la upcall de GPIO.
-struct Listener;
-
-static LISTENER: Listener = Listener;
-
-impl Upcall<OneId<DRIVER_NUM, SUBSCRIBE_GPIO>> for Listener {
-    fn upcall(&self, index: u32, level: u32, _: u32) {
-        // Pueden llegar flancos de pines que este proceso no tomó. Escribir su slot
-        // es inocuo porque la siguiente espera lo limpia.
-        if let Some(slot) = SLOTS.get(index as usize) {
-            slot.put(Level::from(level));
-            slot.wake();
-        }
-    }
-}
-
-/// Provoca un panic si otro componente ya había registrado la upcall de GPIO, en
-/// lugar de dejar esperas que nunca despiertan.
-pub struct DetectSteal;
-
-impl libtock_platform::subscribe::Config for DetectSteal {
-    fn returned_nonnull_upcall(_driver_num: u32, _subscribe_num: u32) {
-        panic!("gpio upcall already owned")
-    }
-}
+static PINS: SourceTable<Level, MAX_PINS, DRIVER_NUM, SUBSCRIBE_GPIO> = SourceTable::new();
 
 /// Registra la upcall de GPIO de forma permanente y ejecuta `f`.
 ///
-/// Como `f` devuelve [`Never`], el `share::scope` no termina y la suscripción
-/// permanece válida durante toda la vida del proceso. [`crate::run`] va al fondo
-/// del anidamiento:
+/// [`crate::run`] va al fondo del anidamiento:
 ///
 /// ```ignore
 /// fn main() {
@@ -189,19 +99,8 @@ impl libtock_platform::subscribe::Config for DetectSteal {
 /// }
 /// ```
 pub fn init(f: impl FnOnce() -> Never) -> ! {
-    let count: u32 = S::command(DRIVER_NUM, command::COUNT, 0, 0)
-        .to_result::<u32, ErrorCode>()
-        .expect("gpio driver not present");
-    assert!(
-        count as usize <= MAX_PINS,
-        "la placa reporta más pines que MAX_PINS"
-    );
-
-    match share::scope(|subscribe| {
-        S::subscribe::<_, _, DetectSteal, DRIVER_NUM, SUBSCRIBE_GPIO>(subscribe, &LISTENER)
-            .expect("could not subscribe to the gpio upcall");
-        f()
-    }) {}
+    let count = Pin::count().expect("gpio driver not present");
+    PINS.init(count, f)
 }
 
 /// Acceso exclusivo a un pin configurado como entrada.
@@ -223,13 +122,9 @@ impl Pin {
     /// Devuelve `None` si el índice no corresponde a un pin de la placa o si ya fue
     /// tomado.
     pub fn take(index: u32, pull: Pull) -> Option<Pin> {
-        if index as usize >= MAX_PINS {
-            return None;
-        }
         // El bit se reserva antes de configurar el hardware para no reconfigurar un
         // pin que ya tiene dueño.
-        let bit = 1u32 << index;
-        if TAKEN.fetch_or(bit, Ordering::AcqRel) & bit != 0 {
+        if !PINS.claim(index) {
             return None;
         }
         // `command 5` configura el pin y a la vez verifica que exista.
@@ -238,7 +133,7 @@ impl Pin {
         {
             Ok(()) => Some(Pin { index }),
             Err(_) => {
-                TAKEN.fetch_and(!bit, Ordering::AcqRel);
+                PINS.release(index);
                 None
             }
         }
@@ -275,9 +170,9 @@ impl Drop for Pin {
     fn drop(&mut self) {
         let _ = S::command(DRIVER_NUM, command::DISABLE_INTERRUPT, self.index, 0)
             .to_result::<(), ErrorCode>();
-        TAKEN.fetch_and(!(1u32 << self.index), Ordering::AcqRel);
+        PINS.release(self.index);
         // No se hace `unsubscribe`: la suscripción es compartida por todos los
-        // pines. Ver `docs/documentacion.md`, sección 1.4.
+        // pines.
     }
 }
 
@@ -305,19 +200,13 @@ impl Future for PinWait {
 
     fn poll(self: Pinned<&mut Self>, cx: &mut Context<'_>) -> Poll<Level> {
         let this = self.get_mut();
-        let slot = &SLOTS[this.index as usize];
+        let (index, edge) = (this.index, this.edge);
+        let slot = PINS.slot(index);
 
-        if !this.armed {
-            // Orden: limpiar, registrar, habilitar, consultar. Ver
-            // `docs/documentacion.md`, sección 3.
-            slot.clear_last();
-            slot.register(cx.waker());
-            let _ = S::command(DRIVER_NUM, command::ENABLE_INTERRUPT, this.index, this.edge)
+        slot.arm(&mut this.armed, cx.waker(), || {
+            let _ = S::command(DRIVER_NUM, command::ENABLE_INTERRUPT, index, edge)
                 .to_result::<(), ErrorCode>();
-            this.armed = true;
-        } else {
-            slot.register(cx.waker());
-        }
+        });
 
         match slot.take() {
             Some(level) => Poll::Ready(level),
@@ -330,6 +219,6 @@ impl Drop for PinWait {
     fn drop(&mut self) {
         // La interrupción permanece habilitada hasta que se suelta el `Pin`, porque
         // deshabilitarla aquí exigiría reconfigurar el pin en la siguiente espera.
-        SLOTS[self.index as usize].clear_waker();
+        PINS.slot(self.index).clear_waker();
     }
 }
