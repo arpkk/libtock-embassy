@@ -67,6 +67,10 @@ mod command {
 ///   correcta la extensión a 64 bits (no hay upcall de overflow).
 const MAX_DT: u64 = 1 << 30;
 
+/// Tiempo tras el cual una alarma vencida cuya upcall no llegó se da por
+/// perdida y se vuelve a armar.
+const LOST_AFTER: u64 = embassy_time_driver::TICK_HZ;
+
 /// Driver de tiempo de Embassy respaldado por la cápsula de alarma de Tock.
 pub struct TockDriver {
     /// Cuenta de vueltas del contador de 32 bits: la parte alta de `now()`.
@@ -75,12 +79,15 @@ pub struct TockDriver {
     last: Mutex<Cell<u32>>,
     /// Cola de plazos, reutilizada de `embassy-time-queue-utils`.
     queue: Mutex<RefCell<Queue>>,
+    /// Plazo de la alarma armada en el kernel cuya upcall todavía no se atendió.
+    armed: Mutex<Cell<Option<u64>>>,
 }
 
 embassy_time_driver::time_driver_impl!(static DRIVER: TockDriver = TockDriver {
     high: Mutex::new(Cell::new(0)),
     last: Mutex::new(Cell::new(0)),
     queue: Mutex::new(RefCell::new(Queue::new())),
+    armed: Mutex::new(Cell::new(None)),
 });
 
 impl Driver for TockDriver {
@@ -91,11 +98,23 @@ impl Driver for TockDriver {
     fn schedule_wake(&self, at: u64, waker: &Waker) {
         critical_section::with(|cs| {
             let mut queue = self.queue.borrow(cs).borrow_mut();
-            if queue.schedule_wake(at, waker) {
-                let mut next = queue.next_expiration(self.extend(cs));
-                while !self.set_alarm(cs, next) {
-                    next = queue.next_expiration(self.extend(cs));
+            if !queue.schedule_wake(at, waker) {
+                return;
+            }
+            let now = self.extend(cs);
+            let mut next = queue.next_expiration(now);
+            // Se re-arma solo si la alarma armada no alcanza a cubrir `next`. Si ya
+            // venció, su upcall está en cola y `on_alarm` re-arma al atenderla;
+            // re-armar ahora encolaría una upcall más por el mismo vencimiento.
+            if let Some(armed) = self.armed.borrow(cs).get() {
+                let pending = armed <= now && now - armed < LOST_AFTER;
+                let covers = armed > now && armed <= next.min(now + MAX_DT);
+                if pending || covers {
+                    return;
                 }
+            }
+            while !self.set_alarm(cs, next) {
+                next = queue.next_expiration(self.extend(cs));
             }
         })
     }
@@ -132,15 +151,20 @@ impl TockDriver {
         // `extend` acaba de refrescar `last`, así que `reference <= now`.
         let reference = self.last.borrow(cs).get();
         let dt = (at - now) as u32;
-        S::command(DRIVER_NUM, command::SET_ABSOLUTE, reference, dt)
+        let ok = S::command(DRIVER_NUM, command::SET_ABSOLUTE, reference, dt)
             .to_result::<u32, ErrorCode>()
-            .is_ok()
+            .is_ok();
+        if ok {
+            self.armed.borrow(cs).set(Some(at));
+        }
+        ok
     }
 
     /// La "ISR". En un HAL de Embassy esto sería el handler del interrupt; acá
     /// lo dispara la upcall de la cápsula, que corre dentro de un `yield`.
     fn on_alarm(&self) {
         critical_section::with(|cs| {
+            self.armed.borrow(cs).set(None);
             let mut queue = self.queue.borrow(cs).borrow_mut();
             let mut next = queue.next_expiration(self.extend(cs));
             while !self.set_alarm(cs, next) {
@@ -162,13 +186,11 @@ impl Upcall<OneId<DRIVER_NUM, SUBSCRIBE_ALARM>> for TockDriver {
     }
 }
 
-/// `subscribe::Config` que hace ruido si alguien más ya tenía registrada la
-/// upcall de alarma.
+/// Provoca un panic si otro componente ya había registrado la upcall de alarma.
 ///
-/// Es la trampa para el conflicto real de este diseño: [`crate::alarm`] y
-/// cualquier otro usuario de `Alarm::sleep_for` se suscriben al mismo par
-/// `(0, 0)` y, al salir de su `share::scope`, hacen `unsubscribe` y dejan al
-/// driver de tiempo mudo. Mejor un panic ruidoso que timers que no disparan.
+/// No detecta a quien se suscribe después: `Alarm::sleep_for` usa la
+/// configuración por defecto, reemplaza esta suscripción sin aviso y, al
+/// terminar, deja al driver de tiempo mudo.
 pub struct DetectSteal;
 
 impl libtock_platform::subscribe::Config for DetectSteal {
