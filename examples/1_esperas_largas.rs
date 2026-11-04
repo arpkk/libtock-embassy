@@ -88,4 +88,25 @@ tock$ [3s] 3 s: pedido=3000000us medido=3004272us retraso=4272us ok
 [561s] 600 s: empieza
 [1161s] 600 s: pedido=600000000us medido=600004638us retraso=4638us ok
 fin
+
+ahora
+[0s] 0 ticks: empieza
+at(0): 213us
+[0s] 0 ticks: pedido=0us medido=16906us retraso=16906us ok
+[0s] 1 tick: empieza
+[0s] 1 tick: pedido=0us medido=4272us retraso=4272us ok
+[0s] 1 ms: empieza
+at(now): 30242us
+[0s] 1 ms: pedido=1000us medido=7171us retraso=6171us ok
+[0s] 3 s: empieza
+tock$ [3s] 3 s: pedido=3000000us medido=3004211us retraso=4211us ok
+[3s] 2^30 ticks: empieza
+[131s] 2^30 ticks: pedido=128000000us medido=128004791us retraso=4791us ok
+[131s] 130 s: empieza
+[261s] 130 s: pedido=130000000us medido=130004547us retraso=4547us ok
+[261s] 300 s: empieza
+[561s] 300 s: pedido=300000000us medido=300004577us retraso=4577us ok
+[561s] 600 s: empieza
+[1161s] 600 s: pedido=600000000us medido=600004577us retraso=4577us ok
+fin
  */

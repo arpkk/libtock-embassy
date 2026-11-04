@@ -9,8 +9,8 @@
 //! `(driver 0x0, subscribe 0)`. Si una tarea llama a `sleep_for` mientras corre
 //! [`crate::run`], le roba la upcall al driver de tiempo y al salir del
 //! `share::scope` hace `unsubscribe`, dejando a `embassy_time::Timer` mudo para
-//! siempre. Bajo `crate::run` esto se detecta y hace panic
-//! ([`crate::time_driver::DetectSteal`]). Para dormir usar `Timer::after`.
+//! siempre, sin panic: `sleep_for` se suscribe con la configuración por defecto,
+//! que ignora la upcall anterior. Para dormir usar `Timer::after`.
 
 use core::cell::Cell;
 

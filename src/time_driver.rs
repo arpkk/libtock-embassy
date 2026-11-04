@@ -40,6 +40,9 @@
 use core::cell::{Cell, RefCell};
 use core::task::Waker;
 
+#[cfg(feature = "stats")]
+use core::sync::atomic::Ordering::Relaxed;
+
 use critical_section::{CriticalSection, Mutex};
 use embassy_time_driver::Driver;
 use embassy_time_queue_utils::Queue;
@@ -110,6 +113,8 @@ impl Driver for TockDriver {
                 let pending = armed <= now && now - armed < LOST_AFTER;
                 let covers = armed > now && armed <= next.min(now + MAX_DT);
                 if pending || covers {
+                    #[cfg(feature = "stats")]
+                    stats::SKIPPED.fetch_add(1, Relaxed);
                     return;
                 }
             }
@@ -128,6 +133,8 @@ impl TockDriver {
         // Ante un error nos quedamos con el valor cacheado: `now()` no puede
         // fallar ni retroceder. Devolver 0 se vería como una vuelta y corrompería
         // `high` para siempre.
+        #[cfg(feature = "stats")]
+        stats::TIME.fetch_add(1, Relaxed);
         let raw: u32 = S::command(DRIVER_NUM, command::TIME, 0, 0)
             .to_result()
             .unwrap_or_else(|_: ErrorCode| last.get());
@@ -151,6 +158,8 @@ impl TockDriver {
         // `extend` acaba de refrescar `last`, así que `reference <= now`.
         let reference = self.last.borrow(cs).get();
         let dt = (at - now) as u32;
+        #[cfg(feature = "stats")]
+        stats::SET.fetch_add(1, Relaxed);
         let ok = S::command(DRIVER_NUM, command::SET_ABSOLUTE, reference, dt)
             .to_result::<u32, ErrorCode>()
             .is_ok();
@@ -182,7 +191,44 @@ impl Upcall<OneId<DRIVER_NUM, SUBSCRIBE_ALARM>> for TockDriver {
     // paga tener que reconstruir ese argumento de orden cada vez que se toca
     // este archivo.
     fn upcall(&self, _now: u32, _expiration: u32, _: u32) {
+        #[cfg(feature = "stats")]
+        stats::UPCALLS.fetch_add(1, Relaxed);
         self.on_alarm()
+    }
+}
+
+/// Contadores del driver para mediciones. Solo existen con la feature `stats`.
+#[cfg(feature = "stats")]
+pub mod stats {
+    use core::sync::atomic::AtomicU32;
+    use core::sync::atomic::Ordering::Relaxed;
+
+    pub(super) static TIME: AtomicU32 = AtomicU32::new(0);
+    pub(super) static SET: AtomicU32 = AtomicU32::new(0);
+    pub(super) static UPCALLS: AtomicU32 = AtomicU32::new(0);
+    pub(super) static SKIPPED: AtomicU32 = AtomicU32::new(0);
+
+    /// Cuentas acumuladas desde la última llamada a [`take`].
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct Stats {
+        /// Lecturas del contador (`command 2`).
+        pub time: u32,
+        /// Alarmas armadas (`command 6`).
+        pub set: u32,
+        /// Upcalls de alarma atendidas.
+        pub upcalls: u32,
+        /// Re-armes evitados porque la alarma armada ya cubría el plazo.
+        pub skipped: u32,
+    }
+
+    /// Devuelve las cuentas y las deja en cero.
+    pub fn take() -> Stats {
+        Stats {
+            time: TIME.swap(0, Relaxed),
+            set: SET.swap(0, Relaxed),
+            upcalls: UPCALLS.swap(0, Relaxed),
+            skipped: SKIPPED.swap(0, Relaxed),
+        }
     }
 }
 

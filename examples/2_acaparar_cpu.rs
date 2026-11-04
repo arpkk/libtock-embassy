@@ -88,4 +88,27 @@ tick 12 now=245s
 tick 13 now=246s
 
 El reloj perdio una vuelta entera, el driver debe leer el contador al menos una vez cada 512s.
+
+
+tock$ tick 1 now=1s
+tick 2 now=2s
+hog 5s empieza
+hog 5s: real=5000ms now()=5000ms
+tick 3 now=8s
+tick 4 now=9s
+tick 5 now=10s
+hog 200s empieza
+hog 200s: real=200000ms now()=200000ms
+tick 6 now=211s
+tick 7 now=212s
+tick 8 now=213s
+hog 540s empieza
+hog 540s: real=540000ms now()=28000ms
+tick 9 now=242s
+tick 10 now=243s
+tick 11 now=244s
+tick 12 now=245s
+tick 13 now=246s
+tick 14 now=247s
+tick 15 now=248s
 */
