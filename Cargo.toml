@@ -29,8 +29,11 @@ static_cell = "2"
 cortex-m = { version = "0.7.7", features = ["critical-section-single-core"] }
 
 [features]
-# Contadores del driver de tiempo (`time_driver::stats`), para mediciones.
+# Contadores del driver de tiempo (`stats`), para mediciones.
 stats = []
+# Reemplaza el driver de `embassy-time` por `timer`: timers relativos de 32 bits.
+# Los ejemplos que usan `embassy_time` no linkean con esta feature.
+relative-timer = []
 
 [[example]]
 name = "6_tormenta_lenta"
@@ -43,6 +46,10 @@ required-features = ["stats"]
 [[example]]
 name = "8_mismo_periodo"
 required-features = ["stats"]
+
+[[example]]
+name = "9_tormenta_lenta_relativa"
+required-features = ["relative-timer", "stats"]
 
 [build-dependencies]
 libtock_build_scripts = {git = "https://www.github.com/tock/libtock-rs", rev = "0766d8cf65b21f01e3340e4b37b345b177a4fb55" }

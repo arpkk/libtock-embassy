@@ -52,8 +52,13 @@ pub mod executor;
 pub mod gpio;
 pub mod leds;
 mod source;
+#[cfg(feature = "stats")]
+pub mod stats;
 pub mod task;
+#[cfg(not(feature = "relative-timer"))]
 pub mod time_driver;
+#[cfg(feature = "relative-timer")]
+pub mod timer;
 
 pub use executor::run;
 

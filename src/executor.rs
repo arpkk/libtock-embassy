@@ -86,5 +86,9 @@ impl Executor {
 /// ```
 pub fn run(init: impl FnOnce(Spawner)) -> ! {
     static EXECUTOR: StaticCell<Executor> = StaticCell::new();
-    crate::time_driver::init(|| EXECUTOR.init(Executor::new()).run(init))
+    #[cfg(not(feature = "relative-timer"))]
+    use crate::time_driver::init as init_time;
+    #[cfg(feature = "relative-timer")]
+    use crate::timer::init as init_time;
+    init_time(|| EXECUTOR.init(Executor::new()).run(init))
 }
