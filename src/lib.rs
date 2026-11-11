@@ -35,7 +35,11 @@ pub use libtock_runtime as runtime;
 // una API paralela.
 pub use embassy_executor;
 pub use embassy_futures;
+#[cfg(feature = "embassy-time")]
 pub use embassy_time;
+
+#[cfg(not(any(feature = "embassy-time", feature = "relative-timer")))]
+compile_error!("hace falta la feature `embassy-time` (por defecto) o `relative-timer`");
 
 /// Tipo vacío: `Never` en posición de retorno obliga a que una función no vuelva.
 ///
@@ -55,7 +59,7 @@ mod source;
 #[cfg(feature = "stats")]
 pub mod stats;
 pub mod task;
-#[cfg(not(feature = "relative-timer"))]
+#[cfg(all(feature = "embassy-time", not(feature = "relative-timer")))]
 pub mod time_driver;
 #[cfg(feature = "relative-timer")]
 pub mod timer;

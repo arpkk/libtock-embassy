@@ -19,20 +19,24 @@ embassy-futures = "0.1"
 # tick-hz: la cápsula de alarma de Tock devuelve los ticks "left-justified" a
 # 32 bits, así que la frecuencia que ve userspace es la del RTC escalada.
 # nRF52840: RTC de 24 bits a 32768 Hz -> 32768 << (32-24) = 8_388_608 Hz.
-embassy-time = { version = "0.5", features = ["tick-hz-8_388_608"] }
-embassy-time-driver = "0.2"
+embassy-time = { version = "0.5", features = ["tick-hz-8_388_608"], optional = true }
+embassy-time-driver = { version = "0.2", optional = true }
 # Sin `generic-queue-*`: usamos la cola integrada, que guarda el nodo dentro de
 # cada tarea de embassy-executor (sin heap, sin capacidad fija).
-embassy-time-queue-utils = { version = "0.3", features = ["integrated-timers"] }
+embassy-time-queue-utils = { version = "0.3", features = ["integrated-timers"], optional = true }
 critical-section = "1.1"
 static_cell = "2"
 cortex-m = { version = "0.7.7", features = ["critical-section-single-core"] }
 
 [features]
+default = ["embassy-time"]
+# Driver de `embassy-time` (`time_driver`).
+embassy-time = ["dep:embassy-time", "dep:embassy-time-driver", "dep:embassy-time-queue-utils"]
 # Contadores del driver de tiempo (`stats`), para mediciones.
 stats = []
 # Reemplaza el driver de `embassy-time` por `timer`: timers relativos de 32 bits.
-# Los ejemplos que usan `embassy_time` no linkean con esta feature.
+# Va con `--no-default-features` (el Makefile lo agrega solo): sin
+# `embassy-time-queue-utils`, las tareas no reservan el espacio de su cola.
 relative-timer = []
 
 [[example]]
@@ -46,10 +50,6 @@ required-features = ["stats"]
 [[example]]
 name = "8_mismo_periodo"
 required-features = ["stats"]
-
-[[example]]
-name = "9_tormenta_lenta_relativa"
-required-features = ["relative-timer", "stats"]
 
 [build-dependencies]
 libtock_build_scripts = {git = "https://www.github.com/tock/libtock-rs", rev = "0766d8cf65b21f01e3340e4b37b345b177a4fb55" }

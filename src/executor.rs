@@ -63,6 +63,10 @@ impl Executor {
             // la bandera es una tarea despertando a otra.
             PENDING.store(false, Ordering::Release);
             unsafe { self.inner.poll() };
+            // Antes de ceder se arma la alarma una sola vez por pasada. Puede
+            // despertar tareas, así que va antes de mirar la bandera.
+            #[cfg(feature = "relative-timer")]
+            crate::timer::flush();
             if PENDING.load(Ordering::Acquire) {
                 let _ = S::yield_no_wait();
             } else {
@@ -86,7 +90,7 @@ impl Executor {
 /// ```
 pub fn run(init: impl FnOnce(Spawner)) -> ! {
     static EXECUTOR: StaticCell<Executor> = StaticCell::new();
-    #[cfg(not(feature = "relative-timer"))]
+    #[cfg(all(feature = "embassy-time", not(feature = "relative-timer")))]
     use crate::time_driver::init as init_time;
     #[cfg(feature = "relative-timer")]
     use crate::timer::init as init_time;

@@ -10,6 +10,8 @@ APP_ARCH := cortex-m4
 EXAMPLE ?= blink
 # Features de cargo separadas por coma. Los ejemplos que las exigen las activan solos.
 FEATURES ?= $(if $(filter 6_tormenta_lenta 7_dos_procesos 8_mismo_periodo,$(EXAMPLE)),stats)
+# `relative-timer` reemplaza a la feature por defecto `embassy-time`.
+CARGO_FEATURES = $(if $(findstring relative-timer,$(FEATURES)),--no-default-features) $(if $(FEATURES),--features $(FEATURES))
 TARGET_DIR := target/$(PLATFORM)
 ELF := $(TARGET_DIR)/$(TARGET)/release/examples/$(EXAMPLE)
 TAB_DIR := target/tab
@@ -30,7 +32,7 @@ B_RAM ?= 0x20020000
 all: build
 
 build:
-	LIBTOCK_PLATFORM=$(PLATFORM) cargo build --example $(EXAMPLE) --release $(if $(FEATURES),--features $(FEATURES)) --target=$(TARGET) --target-dir=$(TARGET_DIR)
+	LIBTOCK_PLATFORM=$(PLATFORM) cargo build --example $(EXAMPLE) --release $(CARGO_FEATURES) --target=$(TARGET) --target-dir=$(TARGET_DIR)
 
 tab: build
 	mkdir -p $(TAB_DIR)
@@ -50,8 +52,8 @@ listen:
 # `<EXAMPLE>_b`. Cada una se compila con PROC=a o PROC=b en su propio target dir.
 flash-dos:
 	mkdir -p $(TAB_DIR)
-	PROC=a LIBTOCK_PLATFORM=$(PLATFORM) cargo build --example $(EXAMPLE) --release $(if $(FEATURES),--features $(FEATURES)) --target=$(TARGET) --target-dir=$(TARGET_DIR)-a
-	PROC=b LIBTOCK_LINKER_FLASH=$(B_FLASH) LIBTOCK_LINKER_FLASH_LENGTH=0x10000 LIBTOCK_LINKER_RAM=$(B_RAM) LIBTOCK_LINKER_RAM_LENGTH=64K cargo build --example $(EXAMPLE) --release $(if $(FEATURES),--features $(FEATURES)) --target=$(TARGET) --target-dir=$(TARGET_DIR)-b
+	PROC=a LIBTOCK_PLATFORM=$(PLATFORM) cargo build --example $(EXAMPLE) --release $(CARGO_FEATURES) --target=$(TARGET) --target-dir=$(TARGET_DIR)-a
+	PROC=b LIBTOCK_LINKER_FLASH=$(B_FLASH) LIBTOCK_LINKER_FLASH_LENGTH=0x10000 LIBTOCK_LINKER_RAM=$(B_RAM) LIBTOCK_LINKER_RAM_LENGTH=64K cargo build --example $(EXAMPLE) --release $(CARGO_FEATURES) --target=$(TARGET) --target-dir=$(TARGET_DIR)-b
 	elf2tab --kernel-major 2 --kernel-minor 1 -n $(EXAMPLE)_a -o $(TAB_DIR)/$(EXAMPLE)_a.tab --stack 1024 --minimum-footer-size 256 --protected-region-size $(PROTECTED_REGION_SIZE) $(TARGET_DIR)-a/$(TARGET)/release/examples/$(EXAMPLE),$(APP_ARCH)
 	elf2tab --kernel-major 2 --kernel-minor 1 -n $(EXAMPLE)_b -o $(TAB_DIR)/$(EXAMPLE)_b.tab --stack 1024 --minimum-footer-size 256 --protected-region-size $(PROTECTED_REGION_SIZE) $(TARGET_DIR)-b/$(TARGET)/release/examples/$(EXAMPLE),$(APP_ARCH)
 	tockloader erase-apps $(TOCKLOADER_FLAGS)
