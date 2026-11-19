@@ -1,4 +1,5 @@
 // Como 6_tormenta_lenta, pero todos los workers con el mismo período y desfasados entre sí
+// Durante la medición no se escribe en la consola, salvo que CONSOLE_LOAD lo active
 #![no_main]
 #![no_std]
 
@@ -13,7 +14,7 @@ use libtock_embassy as libtock;
 use libtock::console::Console;
 use libtock::platform::Syscalls;
 use libtock::runtime::{TockSyscalls, set_main, stack_size};
-use libtock::time_driver::stats;
+use libtock::stats;
 
 extern crate libtock_debug_panic;
 
@@ -24,15 +25,21 @@ const N: usize = 7;
 const BASE_PERIOD_US: u64 = 4000;
 const SCALE_PCT: u64 = 50;
 const OFFSET_US: u64 = period_us() / N as u64;
+const CONSOLE_LOAD: bool = false;
 const LOAD_LINE: &str = "# ..............................................................";
 const LOAD_MS: u64 = 40;
 const REPORT_MS: u64 = 1000;
 const DURATION_S: u64 = 60;
+const SAMPLES: usize = (DURATION_S * 1000 / REPORT_MS) as usize;
+const HEADER: &str =
+    "t_ms,worker,period_us,offset_us,n,expected,late_max_us,late_avg_us,passes,cmd_time,cmd_set,upcalls,skipped";
 
 static TOTAL: [AtomicU32; N] = [const { AtomicU32::new(0) }; N];
 static LATE_MAX_US: [AtomicU32; N] = [const { AtomicU32::new(0) }; N];
 static LATE_SUM_US: Mutex<RefCell<[u64; N]>> = Mutex::new(RefCell::new([0; N]));
 static PASSES: AtomicU32 = AtomicU32::new(0);
+static RESULTS: Mutex<RefCell<[Sample; SAMPLES]>> =
+    Mutex::new(RefCell::new([Sample::ZERO; SAMPLES]));
 
 const fn period_us() -> u64 {
     BASE_PERIOD_US * SCALE_PCT / 100
@@ -40,6 +47,37 @@ const fn period_us() -> u64 {
 
 const fn offset_us(i: usize) -> u64 {
     OFFSET_US * i as u64
+}
+
+/// Lo medido de un worker en una ventana.
+#[derive(Clone, Copy)]
+struct Row {
+    n: u32,
+    expected: u32,
+    late_max_us: u32,
+    late_avg_us: u32,
+}
+
+/// Una ventana de REPORT_MS.
+#[derive(Clone, Copy)]
+struct Sample {
+    t_ms: u32,
+    passes: u32,
+    driver: stats::Stats,
+    rows: [Row; N],
+}
+
+impl Row {
+    const ZERO: Self = Self { n: 0, expected: 0, late_max_us: 0, late_avg_us: 0 };
+}
+
+impl Sample {
+    const ZERO: Self = Self {
+        t_ms: 0,
+        passes: 0,
+        driver: stats::Stats { time: 0, set: 0, upcalls: 0, skipped: 0 },
+        rows: [Row::ZERO; N],
+    };
 }
 
 struct Line {
@@ -103,42 +141,69 @@ async fn load() {
     }
 }
 
+/// Guarda una muestra por ventana sin escribir en la consola, y al final imprime el CSV.
 #[embassy_executor::task]
 async fn report() {
     let mut line = Line::new();
-    let _ = line.write_str(
-        "t_ms,worker,period_us,offset_us,n,expected,late_max_us,late_avg_us,passes,cmd_time,cmd_set,upcalls,skipped",
-    );
+    let _ = write!(line, "# midiendo {DURATION_S} s");
     line.send();
+
+    // Descarta lo acumulado mientras se imprimía la línea anterior.
+    let mut seen = [0u32; N];
+    for i in 0..N {
+        seen[i] = TOTAL[i].load(Relaxed);
+        LATE_MAX_US[i].store(0, Relaxed);
+    }
+    critical_section::with(|cs| LATE_SUM_US.replace(cs, [0; N]));
+    PASSES.store(0, Relaxed);
+    let _ = stats::take();
+
     let start = Instant::now();
     let mut prev = start;
-    let mut seen = [0u32; N];
-    let _ = stats::take();
-    for k in 1..=DURATION_S * 1000 / REPORT_MS {
-        Timer::at(start + Duration::from_millis(k * REPORT_MS)).await;
+    for k in 0..SAMPLES {
+        Timer::at(start + Duration::from_millis((k as u64 + 1) * REPORT_MS)).await;
         let now = Instant::now();
         let window_us = now.duration_since(prev).as_micros();
         prev = now;
-        let t_ms = now.duration_since(start).as_millis();
-        let passes = PASSES.swap(0, Relaxed);
-        let d = stats::take();
+        let mut sample = Sample::ZERO;
+        sample.t_ms = now.duration_since(start).as_millis() as u32;
+        sample.passes = PASSES.swap(0, Relaxed);
+        sample.driver = stats::take();
         let sums = critical_section::with(|cs| LATE_SUM_US.replace(cs, [0; N]));
         for i in 0..N {
             let total = TOTAL[i].load(Relaxed);
             let n = total - seen[i];
             seen[i] = total;
-            let avg = if n == 0 { 0 } else { sums[i] / n as u64 };
+            sample.rows[i] = Row {
+                n,
+                expected: (window_us / period_us()) as u32,
+                late_max_us: LATE_MAX_US[i].swap(0, Relaxed),
+                late_avg_us: if n == 0 { 0 } else { (sums[i] / n as u64) as u32 },
+            };
+        }
+        critical_section::with(|cs| RESULTS.borrow_ref_mut(cs)[k] = sample);
+    }
+
+    let _ = line.write_str(HEADER);
+    line.send();
+    for k in 0..SAMPLES {
+        let s = critical_section::with(|cs| RESULTS.borrow_ref(cs)[k]);
+        for (i, r) in s.rows.iter().enumerate() {
             let _ = write!(
                 line,
-                "{t_ms},{i},{},{},{n},{},{},{avg},{passes},{},{},{},{}",
+                "{},{i},{},{},{},{},{},{},{},{},{},{},{}",
+                s.t_ms,
                 period_us(),
                 offset_us(i),
-                window_us / period_us(),
-                LATE_MAX_US[i].swap(0, Relaxed),
-                d.time,
-                d.set,
-                d.upcalls,
-                d.skipped,
+                r.n,
+                r.expected,
+                r.late_max_us,
+                r.late_avg_us,
+                s.passes,
+                s.driver.time,
+                s.driver.set,
+                s.driver.upcalls,
+                s.driver.skipped,
             );
             line.send();
         }
@@ -155,7 +220,9 @@ fn main() {
             spawner.spawn(worker(i, t0).unwrap());
         }
         spawner.spawn(spin().unwrap());
-        spawner.spawn(load().unwrap());
+        if CONSOLE_LOAD {
+            spawner.spawn(load().unwrap());
+        }
         spawner.spawn(report().unwrap());
     })
 }
