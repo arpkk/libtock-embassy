@@ -1,22 +1,30 @@
 //! Timers relativos de 32 bits sobre la cápsula de alarma de Tock (driver `0x0`).
 //!
-//! Se activa con la feature `relative-timer` y reemplaza a [`embassy_time`]: un
-//! `Timer` es un par `(reference, dt)` en ticks crudos del contador, igual que los
-//! argumentos de `command 6`. No hay reloj de 64 bits, no se cuentan vueltas y no
-//! hace falta una alarma de mantenimiento: sin timers activos no se arma nada.
+//! Se activa con la feature `relative-timer` y reemplaza a `embassy_time`. Un
+//! `Timer` se describe igual que los argumentos de `command 6`: `dt` ticks
+//! contados desde `reference`, en ticks crudos del contador. No hay reloj de 64
+//! bits ni alarma de mantenimiento: sin timers activos no se arma nada.
 //!
-//! Todo se compara con aritmética modular, como en la cápsula. Por eso `dt` se
-//! limita a [`MAX_DT`]: un timer se reconoce como vencido mientras su atraso sea
-//! menor que `2^32 - dt`. Un atraso mayor no se detecta y el timer espera una
-//! vuelta más, pero el error no se acumula en ningún reloj.
+//! El objetivo es gastar la menor cantidad de syscalls posible:
 //!
-//! Los plazos activos viven en una tabla estática de [`MAX_TIMERS`] entradas.
+//! - La alarma se decide una sola vez por pasada del executor, en [`flush`],
+//!   justo antes del `yield`. Muchos timers que cambian en una pasada cuestan a lo
+//!   sumo un `command 6`.
+//! - `Timer::after` no lee el contador al crearse. Su `dt` se empieza a contar en
+//!   el `flush` de esa pasada, con una sola lectura para todos los timers creados
+//!   en ella. Puede esperar un poco más que `dt`, nunca menos.
+//! - `Timer::new` no lee el contador: se ubica en la cola respecto de la última
+//!   hora conocida.
+//! - La upcall usa la hora que trae (`arg0`) en vez de leer el contador.
+//! - Un `poll` repetido no hace syscalls.
+
+mod queue;
 
 use core::cell::RefCell;
 use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicU32, Ordering};
-use core::task::{Context, Poll, Waker};
+use core::task::{Context, Poll};
 
 #[cfg(feature = "stats")]
 use core::sync::atomic::Ordering::Relaxed;
@@ -28,6 +36,7 @@ use libtock_platform::{ErrorCode, Syscalls, Upcall, share};
 use crate::Never;
 use crate::runtime::TockSyscalls as S;
 use crate::source::DetectSteal;
+use queue::{Action, Armed, Link, Node, Queue};
 
 #[cfg(feature = "stats")]
 pub use crate::stats;
@@ -38,16 +47,17 @@ const SUBSCRIBE_ALARM: u32 = 0;
 mod command {
     pub const FREQUENCY: u32 = 1;
     pub const TIME: u32 = 2;
+    pub const STOP: u32 = 3;
     pub const SET_ABSOLUTE: u32 = 6;
 }
 
-/// `dt` máximo de un timer: media vuelta del contador.
+/// `dt` máximo de un timer: media vuelta del contador. Deja otra media vuelta
+/// para reconocer un plazo vencido aunque se atienda tarde.
 pub const MAX_DT: u32 = 1 << 31;
 
-/// Timers que pueden esperar a la vez. Superarlo provoca un panic.
-pub const MAX_TIMERS: usize = 16;
-
 static HZ: AtomicU32 = AtomicU32::new(0);
+
+static QUEUE: Mutex<RefCell<Queue>> = Mutex::new(RefCell::new(Queue::new()));
 
 /// Frecuencia del contador en Hz (`command 1`). Se lee una vez y queda guardada.
 pub fn frequency() -> u32 {
@@ -62,8 +72,15 @@ pub fn frequency() -> u32 {
     hz
 }
 
-/// Valor actual del contador de 32 bits (`command 2`).
+/// Valor actual del contador de 32 bits (`command 2`). La lectura también le
+/// sirve a la cola como hora conocida.
 pub fn now() -> u32 {
+    let now = read();
+    critical_section::with(|cs| QUEUE.borrow_ref_mut(cs).advance(now));
+    now
+}
+
+fn read() -> u32 {
     #[cfg(feature = "stats")]
     stats::TIME.fetch_add(1, Relaxed);
     S::command(DRIVER_NUM, command::TIME, 0, 0)
@@ -86,142 +103,86 @@ fn ticks(value: u32, per_second: u64) -> u32 {
     u32::try_from(ticks).expect("la duración no cabe en 32 bits de ticks")
 }
 
-#[derive(Clone, Copy)]
-struct Deadline {
-    reference: u32,
-    dt: u32,
-}
-
-impl Deadline {
-    /// Mismo criterio que la cápsula: vencido si `now` salió de `[reference, reference + dt)`.
-    fn expired(self, now: u32) -> bool {
-        now.wrapping_sub(self.reference) >= self.dt
-    }
-
-    /// Ticks que faltan. Solo tiene sentido si no ha vencido.
-    fn remaining(self, now: u32) -> u32 {
-        self.dt - now.wrapping_sub(self.reference)
-    }
-
-    /// Ticks de atraso. Solo tiene sentido si ya venció.
-    fn overdue(self, now: u32) -> u32 {
-        now.wrapping_sub(self.reference) - self.dt
-    }
-}
-
-enum Slot {
-    Free,
-    Waiting { deadline: Deadline, waker: Waker },
-    Fired,
-}
-
-struct State {
-    slots: [Slot; MAX_TIMERS],
-    /// Alarma armada en el kernel cuya upcall todavía no se atendió.
-    armed: Option<Deadline>,
-}
-
-static STATE: Mutex<RefCell<State>> = Mutex::new(RefCell::new(State {
-    slots: [const { Slot::Free }; MAX_TIMERS],
-    armed: None,
-}));
-
-impl State {
-    /// Guarda un plazo nuevo y re-arma solo si la alarma armada no lo cubre.
-    ///
-    /// Si la alarma ya venció, su upcall está en cola y al atenderla se re-arma;
-    /// re-armar ahora encolaría una upcall más por el mismo vencimiento.
-    fn insert(&mut self, now: u32, deadline: Deadline, waker: &Waker) -> usize {
-        let index = self
-            .slots
-            .iter()
-            .position(|slot| matches!(slot, Slot::Free))
-            .expect("más timers activos que MAX_TIMERS");
-        self.slots[index] = Slot::Waiting {
-            deadline,
-            waker: waker.clone(),
-        };
-        let covered = self.armed.is_some_and(|armed| {
-            if armed.expired(now) {
-                // Si lleva más de 1 s vencida, la upcall se dio por perdida.
-                armed.overdue(now) < frequency()
-            } else {
-                armed.remaining(now) <= deadline.remaining(now)
-            }
-        });
-        if covered {
-            #[cfg(feature = "stats")]
-            stats::SKIPPED.fetch_add(1, Relaxed);
-        } else {
-            self.service(now);
+/// Arma la alarma del kernel según lo que cambió en la cola durante la pasada.
+///
+/// El executor la llama antes de cada `yield`. Es la única que lee el contador
+/// para los `Timer::after` nuevos y la única que arma la alarma.
+pub(crate) fn flush() {
+    critical_section::with(|cs| {
+        let mut queue = QUEUE.borrow_ref_mut(cs);
+        if queue.has_pending() {
+            queue.flush_pending(read());
         }
-        index
-    }
-
-    /// Despierta los timers vencidos y arma la alarma para el más próximo.
-    fn service(&mut self, now: u32) {
-        let mut next: Option<Deadline> = None;
-        for slot in &mut self.slots {
-            let Slot::Waiting { deadline, waker } = slot else {
-                continue;
-            };
-            let deadline = *deadline;
-            if deadline.expired(now) {
-                waker.wake_by_ref();
-                *slot = Slot::Fired;
-            } else if next.is_none_or(|n| deadline.remaining(now) < n.remaining(now)) {
-                next = Some(deadline);
+        match queue.decide(frequency()) {
+            Action::Nothing => {}
+            Action::Skip => {
+                #[cfg(feature = "stats")]
+                stats::SKIPPED.fetch_add(1, Relaxed);
+            }
+            Action::Arm { reference, dt } => {
+                #[cfg(feature = "stats")]
+                stats::SET.fetch_add(1, Relaxed);
+                // Con `reference` explícita no importa cuánto pasó desde la última
+                // hora conocida: si el plazo ya venció, la cápsula encola la upcall
+                // en esta misma syscall.
+                let expiration = S::command(DRIVER_NUM, command::SET_ABSOLUTE, reference, dt)
+                    .to_result::<u32, ErrorCode>()
+                    .expect("no se pudo armar la alarma");
+                queue.set_armed(Some(Armed {
+                    reference,
+                    dt,
+                    expiration,
+                }));
+            }
+            Action::Stop => {
+                #[cfg(feature = "stats")]
+                stats::SET.fetch_add(1, Relaxed);
+                // Falla con `ALREADY` si venció entretanto; su upcall llega igual
+                // y la cola la reconoce como vieja.
+                let _ = S::command(DRIVER_NUM, command::STOP, 0, 0).to_result::<(), ErrorCode>();
+                queue.set_armed(None);
             }
         }
-        self.armed = next;
-        if let Some(deadline) = next {
-            // Con `reference` explícita no importa cuánto pasó desde que se leyó `now`:
-            // si el plazo venció entremedio, la cápsula encola la upcall en esta syscall.
-            #[cfg(feature = "stats")]
-            stats::SET.fetch_add(1, Relaxed);
-            S::command(
-                DRIVER_NUM,
-                command::SET_ABSOLUTE,
-                deadline.reference,
-                deadline.dt,
-            )
-            .to_result::<u32, ErrorCode>()
-            .expect("no se pudo armar la alarma");
-        }
-    }
-}
-
-enum Stage {
-    New,
-    Waiting(usize),
-    Done,
+    })
 }
 
 /// Espera hasta que pasen `dt` ticks desde `reference`.
 ///
 /// Igual que `embassy_time::Timer`, cede al menos una vez aunque el plazo ya haya
 /// vencido, para que una tarea atrasada no acapare el executor. Si se descarta
-/// antes de terminar, libera su entrada.
+/// antes de terminar, sale de la cola.
 pub struct Timer {
-    deadline: Deadline,
-    stage: Stage,
+    reference: Option<u32>,
+    dt: u32,
+    node: Node,
 }
 
 impl Timer {
-    /// Timer de `dt` ticks contados desde ahora.
+    /// Timer de `dt` ticks contados desde el final de la pasada actual del executor.
+    ///
+    /// Provoca un panic si `dt` supera [`MAX_DT`].
     pub fn after(dt: u32) -> Self {
-        Self::new(now(), dt)
+        assert!(dt <= MAX_DT, "dt supera MAX_DT");
+        Self {
+            reference: None,
+            dt,
+            node: Node::new(),
+        }
     }
 
     /// Timer de `dt` ticks contados desde `reference`. Sirve para tareas periódicas:
     /// sumar `dt` a `reference` en cada ciclo evita acumular deriva.
     ///
+    /// `reference` tiene que venir de [`now`] o ser un plazo anterior. Una
+    /// referencia en el futuro se ve como un plazo vencido, igual que en la cápsula.
+    ///
     /// Provoca un panic si `dt` supera [`MAX_DT`].
     pub fn new(reference: u32, dt: u32) -> Self {
         assert!(dt <= MAX_DT, "dt supera MAX_DT");
         Self {
-            deadline: Deadline { reference, dt },
-            stage: Stage::New,
+            reference: Some(reference),
+            dt,
+            node: Node::new(),
         }
     }
 }
@@ -230,35 +191,32 @@ impl Future for Timer {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let this = self.get_mut();
+        // Basta una referencia compartida: el nodo solo tiene `Cell`s.
+        let this = self.into_ref().get_ref();
         critical_section::with(|cs| {
-            let mut state = STATE.borrow_ref_mut(cs);
-            match this.stage {
-                Stage::New => {
-                    let now = now();
-                    if this.deadline.expired(now) {
-                        this.stage = Stage::Done;
+            let mut queue = QUEUE.borrow_ref_mut(cs);
+            match this.node.link() {
+                Link::Idle => {
+                    this.node.register(cx.waker());
+                    let waiting = match this.reference {
+                        _ if this.dt == 0 => false,
+                        None => {
+                            queue.push_pending(&this.node, this.dt);
+                            true
+                        }
+                        Some(reference) => queue.insert(&this.node, reference, this.dt),
+                    };
+                    if !waiting {
+                        this.node.set_fired();
                         cx.waker().wake_by_ref();
-                    } else {
-                        let index = state.insert(now, this.deadline, cx.waker());
-                        this.stage = Stage::Waiting(index);
                     }
                     Poll::Pending
                 }
-                Stage::Waiting(index) => match &mut state.slots[index] {
-                    Slot::Waiting { waker, .. } => {
-                        if !waker.will_wake(cx.waker()) {
-                            *waker = cx.waker().clone();
-                        }
-                        Poll::Pending
-                    }
-                    _ => {
-                        state.slots[index] = Slot::Free;
-                        this.stage = Stage::Done;
-                        Poll::Ready(())
-                    }
-                },
-                Stage::Done => Poll::Ready(()),
+                Link::Pending | Link::Linked => {
+                    this.node.register(cx.waker());
+                    Poll::Pending
+                }
+                Link::Fired => Poll::Ready(()),
             }
         })
     }
@@ -266,12 +224,8 @@ impl Future for Timer {
 
 impl Drop for Timer {
     fn drop(&mut self) {
-        // La alarma puede quedar armada para este plazo. Su upcall no despierta a
-        // nadie y al atenderla se re-arma para el siguiente.
-        if let Stage::Waiting(index) = self.stage {
-            critical_section::with(|cs| {
-                STATE.borrow_ref_mut(cs).slots[index] = Slot::Free;
-            });
+        if matches!(self.node.link(), Link::Pending | Link::Linked) {
+            critical_section::with(|cs| QUEUE.borrow_ref_mut(cs).remove(&self.node));
         }
     }
 }
@@ -281,13 +235,16 @@ struct AlarmUpcall;
 static UPCALL: AlarmUpcall = AlarmUpcall;
 
 impl Upcall<OneId<DRIVER_NUM, SUBSCRIBE_ALARM>> for AlarmUpcall {
-    fn upcall(&self, _now: u32, _expiration: u32, _: u32) {
+    /// `arg0` es la hora en que la cápsula atendió el vencimiento y `arg1` el
+    /// vencimiento, el mismo valor que devolvió el `command 6`. La alarma no se
+    /// re-arma acá: lo hace `flush` al final de la pasada.
+    fn upcall(&self, now: u32, expiration: u32, _: u32) {
         #[cfg(feature = "stats")]
         stats::UPCALLS.fetch_add(1, Relaxed);
         critical_section::with(|cs| {
-            let mut state = STATE.borrow_ref_mut(cs);
-            state.armed = None;
-            state.service(now());
+            let mut queue = QUEUE.borrow_ref_mut(cs);
+            let now = if queue.is_current(now) { now } else { read() };
+            queue.on_upcall(now, expiration);
         })
     }
 }
