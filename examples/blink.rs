@@ -57,7 +57,7 @@ async fn heartbeat() {
         tick = tick.wrapping_add(1);
         // El LED es la única señal observable en placas cuyo kernel no expone
         // consola: alterna cada 1000 ms, en paralelo al parpadeo de `blink`.
-        let _ = if tick % 2 == 0 {
+        let _ = if tick.is_multiple_of(2) {
             Leds::on(led)
         } else {
             Leds::off(led)

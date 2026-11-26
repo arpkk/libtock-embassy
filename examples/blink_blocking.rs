@@ -1,5 +1,5 @@
 //! Línea base pre-driver-de-tiempo: el mismo blink pero durmiendo con
-//! `alarm::Alarm::sleep_for`, que es `async` de firma y bloqueante por dentro.
+//! `Alarm::sleep_for` de `libtock-rs`, que es bloqueante.
 //!
 //! Sirve para dos cosas: comparar tamaño de binario y RAM contra
 //! `examples/blink.rs`, y ver el problema en vivo. `idle_tick_task` se spawnea
@@ -16,11 +16,13 @@
 use core::fmt::Write;
 
 use libtock_embassy as libtock;
-use libtock::alarm::{Alarm, Milliseconds};
-use libtock::console::{self, Console};
+use libtock_alarm::Milliseconds;
+use libtock::console::Console;
 use libtock::executor::Executor;
 use libtock::leds::Leds;
 use libtock::runtime::{set_main, stack_size};
+
+type Alarm = libtock_alarm::Alarm<libtock::runtime::TockSyscalls>;
 use static_cell::StaticCell;
 
 extern crate libtock_debug_panic;
@@ -56,7 +58,7 @@ async fn blink_task() {
     let _ = leds_count;
     let mut count: u32 = 0;
     loop {
-        if count % 4 == 0 {
+        if count.is_multiple_of(4) {
             let _ = writeln!(writer, "blink tick {count}");
         }
         for led_index in 0..active_leds {
@@ -69,7 +71,7 @@ async fn blink_task() {
             }
         }
 
-        Alarm::sleep_for(Milliseconds(250)).await.unwrap();
+        Alarm::sleep_for(Milliseconds(250)).unwrap();
         count = count.wrapping_add(1);
     }
 }
@@ -79,14 +81,14 @@ async fn idle_tick_task() {
     let led = idle_led();
     let mut tick: u32 = 0;
     loop {
-        Alarm::sleep_for(Milliseconds(1000)).await.unwrap();
+        Alarm::sleep_for(Milliseconds(1000)).unwrap();
         tick = tick.wrapping_add(1);
-        let _ = if tick % 2 == 0 {
+        let _ = if tick.is_multiple_of(2) {
             Leds::on(led)
         } else {
             Leds::off(led)
         };
-        let _ = console::write_str_async("idle tick\n").await;
+        let _ = Console::write(b"idle tick\n");
     }
 }
 

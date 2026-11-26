@@ -5,6 +5,10 @@
 //! contados desde `reference`, en ticks crudos del contador. No hay reloj de 64
 //! bits ni alarma de mantenimiento: sin timers activos no se arma nada.
 //!
+//! Cada alarma cubre a lo sumo [`MAX_DT`] ticks. Un timer más largo, hasta
+//! [`MAX_TICKS`], se recorre en tramos de ese largo, con una alarma y una upcall
+//! por tramo.
+//!
 //! El objetivo es gastar la menor cantidad de syscalls posible:
 //!
 //! - La alarma se decide una sola vez por pasada del executor, en [`flush`],
@@ -51,9 +55,14 @@ mod command {
     pub const SET_ABSOLUTE: u32 = 6;
 }
 
-/// `dt` máximo de un timer: media vuelta del contador. Deja otra media vuelta
-/// para reconocer un plazo vencido aunque se atienda tarde.
-pub const MAX_DT: u32 = 1 << 31;
+/// Plazo más largo que se arma en una sola alarma: media vuelta del contador.
+/// Deja otra media vuelta para reconocer un plazo vencido aunque se atienda
+/// tarde. Los timers más largos se recorren en tramos de este largo.
+pub const MAX_DT: u32 = queue::SEGMENT; //256 segundos
+
+/// Plazo máximo de un timer: `2^32` tramos de [`MAX_DT`], unos 35.000 años a
+/// 8.388.608 Hz.
+pub const MAX_TICKS: u64 = (MAX_DT as u64) << 32;
 
 static HZ: AtomicU32 = AtomicU32::new(0);
 
@@ -98,6 +107,11 @@ pub fn ticks_from_micros(us: u32) -> u32 {
     ticks(us, 1_000_000)
 }
 
+/// Convierte segundos a ticks, para timers más largos que [`MAX_DT`].
+pub fn ticks_from_secs(secs: u32) -> u64 {
+    secs as u64 * frequency() as u64
+}
+
 fn ticks(value: u32, per_second: u64) -> u32 {
     let ticks = (value as u64 * frequency() as u64).div_ceil(per_second);
     u32::try_from(ticks).expect("la duración no cabe en 32 bits de ticks")
@@ -107,11 +121,11 @@ fn ticks(value: u32, per_second: u64) -> u32 {
 ///
 /// El executor la llama antes de cada `yield`. Es la única que lee el contador
 /// para los `Timer::after` nuevos y la única que arma la alarma.
-pub(crate) fn flush() {
+pub(crate) fn flush() { // lee la hora una vez para los timers nuevos y decide la alarma
     critical_section::with(|cs| {
         let mut queue = QUEUE.borrow_ref_mut(cs);
         if queue.has_pending() {
-            queue.flush_pending(read());
+            queue.flush_pending(read()); //read hace cmd2 
         }
         match queue.decide(frequency()) {
             Action::Nothing => {}
@@ -125,7 +139,7 @@ pub(crate) fn flush() {
                 // Con `reference` explícita no importa cuánto pasó desde la última
                 // hora conocida: si el plazo ya venció, la cápsula encola la upcall
                 // en esta misma syscall.
-                let expiration = S::command(DRIVER_NUM, command::SET_ABSOLUTE, reference, dt)
+                let expiration = S::command(DRIVER_NUM, command::SET_ABSOLUTE, reference, dt) //cmd 6
                     .to_result::<u32, ErrorCode>()
                     .expect("no se pudo armar la alarma");
                 queue.set_armed(Some(Armed {
@@ -148,26 +162,29 @@ pub(crate) fn flush() {
 
 /// Espera hasta que pasen `dt` ticks desde `reference`.
 ///
+/// Un `dt` mayor que [`MAX_DT`] se recorre en tramos. El tamaño del `Timer` no
+/// depende de `dt`.
+///
 /// Igual que `embassy_time::Timer`, cede al menos una vez aunque el plazo ya haya
 /// vencido, para que una tarea atrasada no acapare el executor. Si se descarta
 /// antes de terminar, sale de la cola.
 pub struct Timer {
-    reference: Option<u32>,
-    dt: u32,
-    node: Node,
+    reference: Option<u32>, //momento desde que se cuenta
+    dt: u32, //cuántos ticks esperar desde reference (primer tramo)
+    node: Node, //nodo de la cola
 }
 
 impl Timer {
     /// Timer de `dt` ticks contados desde el final de la pasada actual del executor.
-    ///
-    /// Provoca un panic si `dt` supera [`MAX_DT`].
     pub fn after(dt: u32) -> Self {
-        assert!(dt <= MAX_DT, "dt supera MAX_DT");
-        Self {
-            reference: None,
-            dt,
-            node: Node::new(),
-        }
+        Self::with(None, dt as u64)
+    }
+
+    /// Como [`Timer::after`], para plazos que no caben en 32 bits.
+    ///
+    /// Provoca un panic si `dt` supera [`MAX_TICKS`].
+    pub fn after_long(dt: u64) -> Self {
+        Self::with(None, dt)
     }
 
     /// Timer de `dt` ticks contados desde `reference`. Sirve para tareas periódicas:
@@ -175,14 +192,28 @@ impl Timer {
     ///
     /// `reference` tiene que venir de [`now`] o ser un plazo anterior. Una
     /// referencia en el futuro se ve como un plazo vencido, igual que en la cápsula.
-    ///
-    /// Provoca un panic si `dt` supera [`MAX_DT`].
     pub fn new(reference: u32, dt: u32) -> Self {
-        assert!(dt <= MAX_DT, "dt supera MAX_DT");
+        Self::with(Some(reference), dt as u64)
+    }
+
+    /// Como [`Timer::new`], para plazos que no caben en 32 bits.
+    ///
+    /// Provoca un panic si `dt` supera [`MAX_TICKS`].
+    pub fn new_long(reference: u32, dt: u64) -> Self {
+        Self::with(Some(reference), dt)
+    }
+
+    /// Parte `dt` en un primer tramo de 1 a [`MAX_DT`] ticks, seguido de tramos
+    /// completos de [`MAX_DT`].
+    fn with(reference: Option<u32>, dt: u64) -> Self {
+        assert!(dt <= MAX_TICKS, "dt supera MAX_TICKS");
+        let segments = dt.saturating_sub(1) / MAX_DT as u64;
+        let node = Node::new();
+        node.set_segments(segments as u32);
         Self {
-            reference: Some(reference),
-            dt,
-            node: Node::new(),
+            reference,
+            dt: (dt - segments * MAX_DT as u64) as u32,
+            node,
         }
     }
 }
@@ -197,11 +228,11 @@ impl Future for Timer {
             let mut queue = QUEUE.borrow_ref_mut(cs);
             match this.node.link() {
                 Link::Idle => {
-                    this.node.register(cx.waker());
+                    this.node.register(cx.waker()); //clona waker a node.waker
                     let waiting = match this.reference {
                         _ if this.dt == 0 => false,
                         None => {
-                            queue.push_pending(&this.node, this.dt);
+                            queue.push_pending(&this.node, this.dt); //copia dt a node.delta y se marca pendiente
                             true
                         }
                         Some(reference) => queue.insert(&this.node, reference, this.dt),

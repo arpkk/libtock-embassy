@@ -9,7 +9,7 @@ use embassy_futures::select::select3;
 use embassy_time::{Duration, Instant, Ticker, TimeoutError, Timer, with_timeout};
 use libtock_embassy as libtock;
 use libtock::buttons::{self, Button};
-use libtock::console::{self, Console};
+use libtock::console::Console;
 use libtock::leds::Leds;
 use libtock::runtime::{set_main, stack_size};
 
@@ -33,7 +33,7 @@ async fn blink() -> ! {
 async fn keepalive() -> ! {
     let mut t = Ticker::every(KEEPALIVE_DELAY);
     loop {
-        let _ = console::write_str_async("KEEPALIVE UP_NEEDED\n").await;
+        let _ = Console::write(b"KEEPALIVE UP_NEEDED\n");
         t.next().await;
     }
 }

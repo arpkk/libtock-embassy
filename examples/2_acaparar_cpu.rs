@@ -6,9 +6,10 @@ use core::fmt::Write;
 
 use embassy_time::{Duration, Instant, TICK_HZ, Timer};
 use libtock_embassy as libtock;
-use libtock::alarm::Alarm;
 use libtock::console::Console;
 use libtock::runtime::{set_main, stack_size};
+
+type Alarm = libtock_alarm::Alarm<libtock::runtime::TockSyscalls>;
 
 extern crate libtock_debug_panic;
 

@@ -19,8 +19,8 @@ async fn blink(led: u32, tiempo: u64) {
     loop {
         Timer::after(Duration::from_millis(tiempo)).await;
         on = !on;
-        if on { 
-            Leds::on(led) 
+        let _ = if on {
+            Leds::on(led)
         } 
         else { 
             Leds::off(led) 

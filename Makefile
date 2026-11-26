@@ -8,8 +8,8 @@ PLATFORM := nrf52840
 TARGET := thumbv7em-none-eabi
 APP_ARCH := cortex-m4
 EXAMPLE ?= blink
-# Features de cargo separadas por coma. Los ejemplos que las exigen las activan solos.
-FEATURES ?= $(if $(filter 6_tormenta_lenta 7_dos_procesos 8_mismo_periodo,$(EXAMPLE)),stats)
+# Features de cargo separadas por coma, por ejemplo FEATURES=relative-timer,stats.
+FEATURES ?=
 # `relative-timer` reemplaza a la feature por defecto `embassy-time`.
 CARGO_FEATURES = $(if $(findstring relative-timer,$(FEATURES)),--no-default-features) $(if $(FEATURES),--features $(FEATURES))
 TARGET_DIR := target/$(PLATFORM)

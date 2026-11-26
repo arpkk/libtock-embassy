@@ -6,9 +6,11 @@ use core::fmt::Write;
 
 use embassy_time::{Duration, Timer};
 use libtock_embassy as libtock;
-use libtock::alarm::{Alarm, Milliseconds};
+use libtock_alarm::Milliseconds;
 use libtock::console::Console;
 use libtock::runtime::{set_main, stack_size};
+
+type Alarm = libtock_alarm::Alarm<libtock::runtime::TockSyscalls>;
 
 extern crate libtock_debug_panic;
 
@@ -33,7 +35,7 @@ async fn intruder() {
     let mut w = Console::writer();
     Timer::after(Duration::from_secs(3)).await;
     let _ = writeln!(w, "sleep_for empieza");
-    let r = Alarm::sleep_for(Milliseconds(200)).await;
+    let r = Alarm::sleep_for(Milliseconds(200));
     let _ = writeln!(w, "sleep_for volvio: {r:?}");
     Timer::after(Duration::from_secs(1)).await;
     let _ = writeln!(w, "intruder: timer despues de sleep_for ok");

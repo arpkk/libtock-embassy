@@ -7,12 +7,20 @@
 //! respecto del anterior, y la cabeza respecto de `anchor`, la última hora
 //! conocida. Así ningún par de plazos se compara con aritmética modular: solo se
 //! resta lo transcurrido desde `anchor`.
+//!
+//! Un plazo más largo que [`SEGMENT`] se recorre en tramos: al vencer cada uno,
+//! el nodo vuelve a la lista en vez de despertar a su tarea.
 #![allow(unsafe_code)] // Punteros entre nodos que viven dentro de los `Timer`.
 
 use core::cell::Cell;
 use core::marker::PhantomPinned;
 use core::ptr::NonNull;
 use core::task::Waker;
+
+/// Plazo más largo que se arma en una sola alarma: media vuelta del contador.
+/// Deja otra media vuelta para reconocer un plazo vencido aunque se atienda
+/// tarde. Los plazos más largos se recorren en tramos de este largo.
+pub(super) const SEGMENT: u32 = 1 << 31;
 
 /// En qué lista está un nodo.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -31,13 +39,15 @@ pub(super) enum Link {
 /// `&mut Timer` es el único acceso a esta memoria, y todos sus campos son `Cell`
 /// porque la cola los modifica a través de punteros compartidos.
 pub(super) struct Node {
-    prev: Cell<Option<NonNull<Node>>>,
-    next: Cell<Option<NonNull<Node>>>,
+    prev: Cell<Option<NonNull<Node>>>, //anterior
+    next: Cell<Option<NonNull<Node>>>, //siguiente
     /// En `Linked`, ticks desde el nodo anterior o desde `anchor` si es la cabeza.
     /// En `Pending`, el `dt` pedido.
-    delta: Cell<u32>,
-    waker: Cell<Option<Waker>>,
-    link: Cell<Link>,
+    delta: Cell<u32>, //cuánto falta desde el nodo anterior o desde la ultima hora conocida si es la cabeza en ticks
+    /// Tramos completos de [`SEGMENT`] que faltan después del plazo actual.
+    segments: Cell<u32>,
+    waker: Cell<Option<Waker>>, //waker de la tarea
+    link: Cell<Link>, //en qué estado esta: Idle (sin poll aun), Pending (esperando flush), Linked (en la lista) o Fired (venció)
     _pin: PhantomPinned,
 }
 
@@ -47,6 +57,7 @@ impl Node {
             prev: Cell::new(None),
             next: Cell::new(None),
             delta: Cell::new(0),
+            segments: Cell::new(0),
             waker: Cell::new(None),
             link: Cell::new(Link::Idle),
             _pin: PhantomPinned,
@@ -55,6 +66,28 @@ impl Node {
 
     pub(super) fn link(&self) -> Link {
         self.link.get()
+    }
+
+    /// Fija cuántos tramos de [`SEGMENT`] siguen al primer plazo.
+    pub(super) fn set_segments(&self, segments: u32) {
+        self.segments.set(segments);
+    }
+
+    /// Si quedan tramos, descuenta los que ya pasaron, dado que el plazo actual
+    /// lleva `late` ticks vencido, y devuelve cuánto falta para el siguiente.
+    /// `None` si el plazo final ya venció.
+    fn next_segment(&self, mut late: u32) -> Option<u32> {
+        let mut left = self.segments.get();
+        while left > 0 {
+            left -= 1;
+            if late < SEGMENT {
+                self.segments.set(left);
+                return Some(SEGMENT - late);
+            }
+            late -= SEGMENT;
+        }
+        self.segments.set(0);
+        None
     }
 
     /// Marca el nodo como vencido sin haber pasado por las listas.
@@ -105,12 +138,12 @@ pub(super) enum Action {
 }
 
 pub(super) struct Queue {
-    head: Option<NonNull<Node>>,
-    pending: Option<NonNull<Node>>,
-    anchor: u32,
-    armed: Option<Armed>,
+    head: Option<NonNull<Node>>, //lista de plazos
+    pending: Option<NonNull<Node>>, //lista pendientes
+    anchor: u32, //última hora conocida en ticks del contador
+    armed: Option<Armed>, //última alarma armada, si no venció
     /// La cabeza cambió desde la última decisión.
-    dirty: bool,
+    dirty: bool, //true si la cabeza cambió desde la última decisión
 }
 
 // SAFETY: el proceso es de un solo hilo y la cola solo se usa dentro de
@@ -149,23 +182,38 @@ impl Queue {
     }
 
     /// Lleva `anchor` a `now` y despierta los plazos vencidos.
-    pub(super) fn advance(&mut self, now: u32) {
+    pub(super) fn advance(&mut self, now: u32) { //equivalente a next_expiration(now), pone la cola al dia
         let mut elapsed = now.wrapping_sub(self.anchor);
         self.anchor = now;
+        // Nodos a los que les quedan tramos, encadenados por `next`. Vuelven a la
+        // lista cuando esta queda al día, contados desde `now`.
+        let mut relink = None;
         while let Some(ptr) = self.head {
             let head = node(ptr);
             let delta = head.delta.get();
             if delta > elapsed {
                 head.delta.set(delta - elapsed);
-                return;
+                break;
             }
             elapsed -= delta;
             self.head = head.next.get();
             if let Some(next) = self.head {
                 node(next).prev.set(None);
             }
-            head.fire();
             self.dirty = true;
+            match head.next_segment(elapsed) {
+                Some(offset) => {
+                    head.delta.set(offset);
+                    head.next.set(relink);
+                    relink = Some(ptr);
+                }
+                None => head.fire(),
+            }
+        }
+        while let Some(ptr) = relink {
+            let entry = node(ptr);
+            relink = entry.next.get();
+            self.link_sorted(entry, entry.delta.get());
         }
     }
 
@@ -182,15 +230,19 @@ impl Queue {
         self.pending = Some(ptr);
     }
 
-    /// Agrega un plazo de `dt` ticks contados desde `reference`, que no puede ser
-    /// posterior a la última hora conocida. Devuelve `false`, sin agregarlo, si ese
-    /// plazo ya venció.
+    /// Agrega un plazo de `dt` ticks contados desde `reference`, más los tramos
+    /// del nodo. `reference` no puede ser posterior a la última hora conocida.
+    /// Devuelve `false`, sin agregarlo, si el plazo final ya venció.
     pub(super) fn insert(&mut self, entry: &Node, reference: u32, dt: u32) -> bool {
         let gone = self.anchor.wrapping_sub(reference);
-        if gone >= dt {
-            return false;
-        }
-        self.link_sorted(entry, dt - gone);
+        let offset = match gone.checked_sub(dt) {
+            None => dt - gone,
+            Some(late) => match entry.next_segment(late) {
+                Some(offset) => offset,
+                None => return false,
+            },
+        };
+        self.link_sorted(entry, offset);
         true
     }
 

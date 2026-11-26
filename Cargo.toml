@@ -4,9 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-libtock = {git = "https://www.github.com/tock/libtock-rs", rev = "0766d8cf65b21f01e3340e4b37b345b177a4fb55" }
 libtock_runtime = {git = "https://www.github.com/tock/libtock-rs", rev = "0766d8cf65b21f01e3340e4b37b345b177a4fb55" }
-libtock_debug_panic = {git = "https://www.github.com/tock/libtock-rs", rev = "0766d8cf65b21f01e3340e4b37b345b177a4fb55" }
 libtock_console = {git = "https://www.github.com/tock/libtock-rs", rev = "0766d8cf65b21f01e3340e4b37b345b177a4fb55" }
 libtock_leds = {git = "https://www.github.com/tock/libtock-rs", rev = "0766d8cf65b21f01e3340e4b37b345b177a4fb55" }
 libtock_platform = {git = "https://www.github.com/tock/libtock-rs", rev = "0766d8cf65b21f01e3340e4b37b345b177a4fb55" }
@@ -67,9 +65,11 @@ required-features = ["stats"]
 name = "12_barrido_relativo"
 required-features = ["relative-timer", "stats"]
 
-[[example]]
-name = "13_acaparar_cpu_relativo"
-required-features = ["relative-timer"]
+[dev-dependencies]
+# Panic por consola, para los ejemplos.
+libtock_debug_panic = {git = "https://www.github.com/tock/libtock-rs", rev = "0766d8cf65b21f01e3340e4b37b345b177a4fb55" }
+# Alarma bloqueante de libtock-rs, solo para los ejemplos de línea base.
+libtock_alarm = {git = "https://www.github.com/tock/libtock-rs", rev = "0766d8cf65b21f01e3340e4b37b345b177a4fb55" }
 
 [build-dependencies]
 libtock_build_scripts = {git = "https://www.github.com/tock/libtock-rs", rev = "0766d8cf65b21f01e3340e4b37b345b177a4fb55" }

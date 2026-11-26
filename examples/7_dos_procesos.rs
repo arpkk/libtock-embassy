@@ -13,7 +13,7 @@ use libtock_embassy as libtock;
 use libtock::console::Console;
 use libtock::platform::Syscalls;
 use libtock::runtime::{TockSyscalls, set_main, stack_size};
-use libtock::time_driver::stats;
+use libtock::stats;
 
 extern crate libtock_debug_panic;
 

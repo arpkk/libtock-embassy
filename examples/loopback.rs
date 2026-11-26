@@ -60,7 +60,7 @@ async fn listen(mut pin: Pin) {
         let level = pin.wait_for_any_edge().await;
         let _ = Leds::toggle(0);
         let received = RECEIVED.fetch_add(1, Relaxed) + 1;
-        if received % 10 == 0 {
+        if received.is_multiple_of(10) {
             let _ = writeln!(
                 w,
                 "enviados={} recibidos={received} nivel={level:?}",
